@@ -1,0 +1,23 @@
+{
+  "appState": {
+    "users": [
+      {
+        "username": "x"
+      }
+    ],
+    "tickets": [
+      {
+        "id": 1
+      }
+    ],
+    "logs": [],
+    "tasks": [],
+    "notes": [],
+    "announcements": [],
+    "settings": {}
+  },
+  "stealthBus": {
+    "sessions": []
+  },
+  "liveBroadcast": null
+}
