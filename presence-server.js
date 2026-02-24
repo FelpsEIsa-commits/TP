@@ -320,6 +320,7 @@ function loadPersistedState() {
 
 let persisted = loadPersistedState();
 let appState = persisted.appState;
+let appStateSerialized = JSON.stringify(appState);
 let stealthBusState = persisted.stealthBus;
 let liveBroadcastState = persisted.liveBroadcast;
 
@@ -581,7 +582,14 @@ wss.on('connection', (ws) => {
     }
 
     if (payload.type === 'app_state_sync') {
-      appState = normalizeAppState(payload.state);
+      const nextState = normalizeAppState(payload.state);
+      const nextSerialized = JSON.stringify(nextState);
+      if (nextSerialized === appStateSerialized) {
+        wsLog('skip app_state_sync unchanged', 'origin=', safeText(payload.origin, '') || 'remote');
+        return;
+      }
+      appState = nextState;
+      appStateSerialized = nextSerialized;
       schedulePersistState();
       wsLog('apply app_state_sync', appStateStats(appState), 'origin=', safeText(payload.origin, '') || 'remote');
       broadcastJson({
