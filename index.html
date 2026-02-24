@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TP Hub Financeiro</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Sora:wght@500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="ambient-bg" aria-hidden="true">
+    <span class="glow glow-a"></span>
+    <span class="glow glow-b"></span>
+    <span class="grid-noise"></span>
+  </div>
+
+  <div id="login-container" class="login-container">
+    <div class="login-panel">
+      <section class="login-showcase">
+        <p class="eyebrow">TP Hub Financeiro</p>
+        <h1>Gestao de carteiras e operacoes internas em um unico painel.</h1>
+        <p>Controle cobrancas, pagamentos, lucro e desempenho mensal dos membros com visao clara e atualizacao em tempo real.</p>
+        <ul class="feature-list">
+          <li>Carteiras com graficos e historico financeiro</li>
+          <li>Controle por permissoes (superadmin e financeiro)</li>
+          <li>Operacao diaria com tickets, tarefas e comunicados</li>
+        </ul>
+      </section>
+
+      <section class="login-card">
+        <h2>Acesso interno</h2>
+        <p class="muted-text">Entre para abrir o painel da TP.</p>
+        <div class="login-form">
+          <label for="username">Usuario</label>
+          <input type="text" id="username" placeholder="Seu usuario" autocomplete="username" />
+          <label for="password">Senha</label>
+          <input type="password" id="password" placeholder="Sua senha" autocomplete="current-password" />
+          <button id="login-button" class="btn-primary">Entrar</button>
+        </div>
+        <p class="login-note">Ambiente interno e protegido para operacao da TP.</p>
+      </section>
+    </div>
+  </div>
+
+  <div id="app-container" class="app-container hidden">
+    <header class="app-header">
+      <div class="header-left">
+        <button id="menu-toggle" class="menu-toggle" aria-label="Abrir menu">Menu</button>
+        <img src="assets/logo.png" alt="Logo TP" class="logo" />
+        <div>
+          <h1 class="app-title">TP Hub Financeiro</h1>
+          <p id="current-page-title" class="page-subtitle">Painel</p>
+        </div>
+      </div>
+      <div class="header-right">
+        <span id="live-clock" class="live-clock"></span>
+        <span id="current-user" class="current-user"></span>
+        <button id="logout-button" class="btn-danger">Sair</button>
+      </div>
+    </header>
+
+    <div class="app-body">
+      <nav id="sidebar" class="sidebar"></nav>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <div id="chat-modal" class="modal hidden">
+    <div id="chat-overlay" class="modal-overlay"></div>
+    <div class="modal-content chat-window">
+      <div class="chat-header">
+        <h3 id="chat-title">Conversa</h3>
+        <button id="close-chat" class="close-modal-btn" aria-label="Fechar conversa">&times;</button>
+      </div>
+      <div id="chat-messages" class="chat-messages"></div>
+      <div class="chat-input-area">
+        <input type="text" id="chat-input" placeholder="Digite sua mensagem..." />
+        <button id="send-message" class="btn-primary">Enviar</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
+
