@@ -160,6 +160,9 @@ function ensureCoreUsersInState(state) {
   CORE_USERS.forEach((seed) => {
     const idx = normalizedUsers.findIndex((user) => user.username === seed.username);
     if (idx < 0) {
+      if (!seed.lockedRole) {
+        return;
+      }
       normalizedUsers.push(
         normalizeServerUser({
           username: seed.username,
