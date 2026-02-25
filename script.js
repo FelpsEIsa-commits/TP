@@ -115,6 +115,27 @@ const ESPIONAGE_STALE_PRESENCE_MS = 5 * 60 * 1000;
 const DEFAULT_MEMBER_CHART_USERS = ['yoon', 'murilo', 'matheus', 'felps'];
 const DEFAULT_MEMBER_PRIVATE_CHAT_LIMIT = 3;
 const STAFF_CHAT_MAX_MESSAGES = 400;
+const MAX_LOG_ENTRIES = 2500;
+const MAX_TICKET_MESSAGES = 600;
+const MAX_LOG_ROWS_RENDER = 600;
+const REALTIME_RENDER_MIN_MS = 1200;
+const REALTIME_HEAVY_RENDER_MIN_MS = 2800;
+const PRESENCE_VIEW_REFRESH_MIN_MS = 1400;
+const BILLING_FINE_MODES = ['fixed', 'percent'];
+const DEFAULT_WALLET_AUTOMATION_SETTINGS = {
+  enabled: false,
+  dueDay: 10,
+  graceDays: 3,
+  fineMode: 'percent',
+  fineValue: 2.5,
+  interestMonthlyPercent: 4,
+  interestCapPercent: 25,
+  minDebtForLateCharge: 20,
+  applyToBlockedUsers: false,
+  autoRunOnWalletControlOpen: false,
+  lastRunDay: '',
+  updatedAt: 0
+};
 const WALLET_HEALTH_VALUES = ['boa', 'ruim', 'critica', 'liquidada'];
 const WALLET_HEALTH_LABELS = {
   boa: 'Boa',
@@ -165,7 +186,8 @@ let settings = {
   walletDashboardMonth: '',
   memberPrivateChatDailyLimit: DEFAULT_MEMBER_PRIVATE_CHAT_LIMIT,
   customRoles: [],
-  staffChatMessages: []
+  staffChatMessages: [],
+  walletAutomation: { ...DEFAULT_WALLET_AUTOMATION_SETTINGS }
 };
 let activeChatTicketId = null;
 let currentPage = 'dashboard';
@@ -187,6 +209,7 @@ let presenceSocketManualClose = false;
 let presenceSocketUrlCandidates = [];
 let presenceSocketUrlIndex = 0;
 let appStateSyncTimer = null;
+let pendingSaveDataFlush = false;
 let remoteStateInitialized = false;
 let remoteStateApplying = false;
 const SYNC_CLIENT_ID = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -200,6 +223,15 @@ const WS_DEBUG_ENABLED = (() => {
   }
 })();
 let deferredRealtimeRenderTimer = null;
+let realtimeRenderFrame = null;
+let realtimeRenderRateTimer = null;
+let pendingRealtimeRender = false;
+let lastRealtimeRenderAt = 0;
+let presenceViewRefreshTimer = null;
+let lastPresenceViewRefreshAt = 0;
+let lastAppliedAppStateHash = '';
+let lastSentAppStateHash = '';
+const chartAnimationRafByCanvas = new WeakMap();
 const realtimeDrafts = {
   intelAlertTitle: '',
   intelAlertContent: '',
@@ -224,17 +256,33 @@ function wsDebugLog(...args) {
 function isRealtimeTypingFieldActive() {
   const active = document.activeElement;
   if (!active || !active.id) return false;
-  return ['intel-alert-title', 'intel-alert-content', 'esp-live-message', 'stealth-input', 'staff-chat-input'].includes(active.id);
+  return ['intel-alert-title', 'intel-alert-content', 'esp-live-message', 'stealth-input', 'staff-chat-input', 'chat-input'].includes(active.id);
 }
 
 function shouldDeferRealtimeRenderForPage(page) {
   if (!isRealtimeTypingFieldActive()) return false;
-  return page === 'intelCenter' || page === 'espionage' || page === 'stealthChat' || page === 'staffChat';
+  return page === 'intelCenter'
+    || page === 'espionage'
+    || page === 'stealthChat'
+    || page === 'staffChat'
+    || page === 'myTickets'
+    || page === 'pending'
+    || page === 'allTickets';
+}
+
+function getRealtimeRenderMinInterval(page = currentPage) {
+  if (page === 'walletControl' || page === 'dashboard') return REALTIME_HEAVY_RENDER_MIN_MS;
+  if (page === 'logs' || page === 'intelCenter' || page === 'espionage') return 1800;
+  return REALTIME_RENDER_MIN_MS;
 }
 
 function requestRealtimeRender() {
   if (!session) return;
   if (shouldDeferRealtimeRenderForPage(currentPage)) {
+    if (realtimeRenderFrame) {
+      window.cancelAnimationFrame(realtimeRenderFrame);
+      realtimeRenderFrame = null;
+    }
     if (!deferredRealtimeRenderTimer) {
       deferredRealtimeRenderTimer = setTimeout(() => {
         deferredRealtimeRenderTimer = null;
@@ -247,8 +295,35 @@ function requestRealtimeRender() {
     clearTimeout(deferredRealtimeRenderTimer);
     deferredRealtimeRenderTimer = null;
   }
-  renderSidebar();
-  renderContent(currentPage);
+  const minInterval = getRealtimeRenderMinInterval(currentPage);
+  const now = Date.now();
+  const elapsed = now - lastRealtimeRenderAt;
+  if (elapsed < minInterval) {
+    pendingRealtimeRender = true;
+    if (!realtimeRenderRateTimer) {
+      realtimeRenderRateTimer = setTimeout(() => {
+        realtimeRenderRateTimer = null;
+        if (!pendingRealtimeRender) return;
+        pendingRealtimeRender = false;
+        requestRealtimeRender();
+      }, Math.max(120, minInterval - elapsed));
+    }
+    return;
+  }
+  pendingRealtimeRender = false;
+  if (realtimeRenderRateTimer) {
+    clearTimeout(realtimeRenderRateTimer);
+    realtimeRenderRateTimer = null;
+  }
+  if (realtimeRenderFrame) return;
+  realtimeRenderFrame = window.requestAnimationFrame(() => {
+    realtimeRenderFrame = null;
+    if (!session) return;
+    lastRealtimeRenderAt = Date.now();
+    renderSidebar();
+    renderContent(currentPage);
+    syncActiveTicketChatView();
+  });
 }
 
 function safeParse(raw, fallback) {
@@ -389,7 +464,7 @@ function canViewLogs() {
 }
 
 function canManageWallets() {
-  return Boolean(session && isAdminRole(session.role));
+  return Boolean(session && isRoleAboveMember(session.role));
 }
 
 function canAccessStaffChat() {
@@ -613,6 +688,70 @@ function getCurrentUser() {
   return users.find((user) => String(user.username || '').trim().toLowerCase() === target) || null;
 }
 
+function updateCurrentUserDisplay() {
+  if (!els.currentUser) return;
+  if (!session) {
+    els.currentUser.textContent = '';
+    return;
+  }
+  const currentUser = getCurrentUser();
+  const username = currentUser ? currentUser.username : session.username;
+  const role = currentUser ? currentUser.role : session.role;
+  els.currentUser.textContent = `${username} (${roleLabel(role)})`;
+}
+
+function syncSessionFromUsers(options = {}) {
+  if (!session) return { changed: false, loggedOut: false };
+  const source = String(options.source || 'unknown');
+  const notify = options.notify !== false;
+  let currentUser = getCurrentUser();
+
+  if (!currentUser) {
+    const sessionKey = String(session.username || '').trim().toLowerCase();
+    const canRestoreLockedUser = sessionKey === 'esther' || sessionKey === 'inteligencia tp';
+    if (canRestoreLockedUser) {
+      ensureCoreUsers();
+      currentUser = getCurrentUser();
+    }
+  }
+
+  if (!currentUser) {
+    wsDebugLog('session invalid after user sync, logout', source);
+    if (notify) {
+      showNotification('Sua conta foi removida. Login encerrado neste dispositivo.', 'warning');
+    }
+    handleLogout();
+    return { changed: true, loggedOut: true };
+  }
+
+  if (currentUser.status === 'blocked') {
+    wsDebugLog('session blocked after user sync, logout', source);
+    if (notify) {
+      showNotification('Sua conta foi bloqueada. Login encerrado.', 'warning');
+    }
+    handleLogout();
+    return { changed: true, loggedOut: true };
+  }
+
+  let changed = false;
+  if (session.role !== currentUser.role) {
+    session.role = currentUser.role;
+    changed = true;
+  }
+  if (session.username !== currentUser.username) {
+    session.username = currentUser.username;
+    changed = true;
+  }
+
+  updateCurrentUserDisplay();
+  if (changed) {
+    wsDebugLog('session synced', source, session.username, session.role);
+    updatePresence(currentPage);
+  }
+
+  return { changed, loggedOut: false };
+}
+
 function getPendingCount() {
   return tickets.filter((ticket) => ticket.status === 'pending').length;
 }
@@ -671,11 +810,7 @@ function initData() {
 
   tickets = Array.isArray(storedTickets) ? storedTickets.map(normalizeTicket) : [];
   logs = Array.isArray(storedLogs)
-    ? storedLogs.map((log) => ({
-        timestamp: Number(log.timestamp) || Date.now(),
-        user: String(log.user || 'sistema'),
-        action: String(log.action || 'acao nao informada')
-      }))
+    ? capLogs(storedLogs.map(normalizeLogEntry))
     : [];
   tasks = Array.isArray(storedTasks) ? storedTasks.map(normalizeTask) : [];
   notes = Array.isArray(storedNotes) ? storedNotes.map(normalizeNote) : [];
@@ -696,6 +831,9 @@ function initData() {
   }
 
   applyDefaultPasswordMigration();
+  const initialHash = getAppStateSyncHash(collectAppStateForSync());
+  lastAppliedAppStateHash = initialHash;
+  lastSentAppStateHash = initialHash;
 
   saveData();
 }
@@ -736,11 +874,15 @@ function normalizeUser(user) {
   const fallbackRoleUpdatedAt = normalizedRole !== 'member' ? 1 : 0;
   const fallbackPrivateChatLimitUpdatedAt = source.privateChatDailyLimit !== null && source.privateChatDailyLimit !== undefined ? 1 : 0;
   const fallbackWalletHealthUpdatedAt = normalizeWalletHealth(source.walletHealth) !== 'boa' ? 1 : 0;
+  const fallbackWalletChartUpdatedAt = typeof source.walletChartEnabled === 'boolean' ? 1 : 0;
+  const fallbackBillingUpdatedAt = source.billingProfile && typeof source.billingProfile === 'object' && !Array.isArray(source.billingProfile) ? 1 : 0;
   const statusUpdatedAt = Math.max(0, Number(source.statusUpdatedAt) || fallbackStatusUpdatedAt);
   const passwordUpdatedAt = Math.max(0, Number(source.passwordUpdatedAt) || fallbackPasswordUpdatedAt);
   const roleUpdatedAt = Math.max(0, Number(source.roleUpdatedAt) || fallbackRoleUpdatedAt);
   const privateChatLimitUpdatedAt = Math.max(0, Number(source.privateChatLimitUpdatedAt) || fallbackPrivateChatLimitUpdatedAt);
   const walletHealthUpdatedAt = Math.max(0, Number(source.walletHealthUpdatedAt) || fallbackWalletHealthUpdatedAt);
+  const walletChartUpdatedAt = Math.max(0, Number(source.walletChartUpdatedAt) || fallbackWalletChartUpdatedAt);
+  const billingUpdatedAt = Math.max(0, Number(source.billingUpdatedAt) || fallbackBillingUpdatedAt);
   const financeUpdatedAt = Math.max(
     Math.max(0, Number(source.financeUpdatedAt) || 0),
     ...financeHistory.map((entry) => Math.max(0, Number(entry.timestamp) || 0))
@@ -769,6 +911,8 @@ function normalizeUser(user) {
     ? { date: usageDate, used: usageCount }
     : { date: '', used: 0 };
   const walletHealth = normalizeWalletHealth(source.walletHealth);
+  const billingProfile = normalizeUserBillingProfile(source.billingProfile, billingUpdatedAt);
+  const normalizedBillingUpdatedAt = Math.max(0, billingUpdatedAt, Number(billingProfile.updatedAt) || 0);
 
   return {
     username: normalizedUsername,
@@ -784,6 +928,7 @@ function normalizeUser(user) {
     lastLoginAt,
     lastLogoutAt,
     walletChartEnabled,
+    walletChartUpdatedAt,
     financeHistory,
     privateChatDailyLimit,
     privateChatUsage,
@@ -793,7 +938,9 @@ function normalizeUser(user) {
     roleUpdatedAt,
     privateChatLimitUpdatedAt,
     walletHealthUpdatedAt,
-    financeUpdatedAt
+    financeUpdatedAt,
+    billingProfile,
+    billingUpdatedAt: normalizedBillingUpdatedAt
   };
 }
 
@@ -812,6 +959,8 @@ function normalizeTicket(ticket) {
           timestamp: Number(message.timestamp) || Date.now()
         }))
         .filter((message) => message.content.trim().length > 0)
+        .sort((a, b) => a.timestamp - b.timestamp)
+        .slice(-MAX_TICKET_MESSAGES)
     : [];
 
   return {
@@ -830,6 +979,8 @@ function normalizeTicket(ticket) {
 }
 
 function normalizeTask(task) {
+  const createdAt = Number(task.createdAt) || Date.now();
+  const updatedAt = Number(task.updatedAt) || createdAt;
   return {
     id: Number(task.id) || createId(),
     owner: String(task.owner || ''),
@@ -837,7 +988,8 @@ function normalizeTask(task) {
     dueDate: task.dueDate ? String(task.dueDate) : '',
     priority: ['low', 'medium', 'high'].includes(task.priority) ? task.priority : 'medium',
     status: TASK_FLOW.includes(task.status) ? task.status : 'todo',
-    createdAt: Number(task.createdAt) || Date.now()
+    createdAt,
+    updatedAt
   };
 }
 
@@ -862,6 +1014,229 @@ function normalizeAnnouncement(item) {
   };
 }
 
+function normalizeLogEntry(log) {
+  return {
+    timestamp: Number(log.timestamp) || Date.now(),
+    user: String(log.user || 'sistema'),
+    action: String(log.action || 'acao nao informada')
+  };
+}
+
+function capLogs(rawLogs) {
+  const source = Array.isArray(rawLogs) ? rawLogs : [];
+  return source.slice(-MAX_LOG_ENTRIES);
+}
+
+function ticketMessageKey(message) {
+  const timestamp = Number(message && message.timestamp) || 0;
+  const sender = String(message && message.sender || '').trim().toLowerCase();
+  const content = String(message && message.content || '').trim();
+  return `${timestamp}:${sender}:${content}`;
+}
+
+function normalizeTicketMessages(rawMessages) {
+  const source = Array.isArray(rawMessages) ? rawMessages : [];
+  const unique = [];
+  const seen = new Set();
+  source
+    .map((message) => ({
+      sender: String(message.sender || 'sistema'),
+      content: String(message.content || ''),
+      timestamp: Number(message.timestamp) || Date.now()
+    }))
+    .filter((message) => message.content.trim().length > 0)
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .forEach((message) => {
+      const key = ticketMessageKey(message);
+      if (seen.has(key)) return;
+      seen.add(key);
+      unique.push(message);
+    });
+  return unique.slice(-MAX_TICKET_MESSAGES);
+}
+
+function areTicketMessageListsEqual(listA, listB) {
+  if (!Array.isArray(listA) || !Array.isArray(listB)) return false;
+  if (listA.length !== listB.length) return false;
+  for (let i = 0; i < listA.length; i += 1) {
+    if (ticketMessageKey(listA[i]) !== ticketMessageKey(listB[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function mergeTicketMessages(remoteMessagesRaw, localMessagesRaw) {
+  return normalizeTicketMessages([...(Array.isArray(remoteMessagesRaw) ? remoteMessagesRaw : []), ...(Array.isArray(localMessagesRaw) ? localMessagesRaw : [])]);
+}
+
+function mergeTicketsWithLocalData(remoteTicketsRaw, localTicketsRaw) {
+  const remoteTickets = Array.isArray(remoteTicketsRaw) ? remoteTicketsRaw.map(normalizeTicket) : [];
+  const localTickets = Array.isArray(localTicketsRaw) ? localTicketsRaw.map(normalizeTicket) : [];
+  const ticketMap = new Map();
+  remoteTickets.forEach((ticket) => {
+    ticketMap.set(ticket.id, ticket);
+  });
+
+  let changed = false;
+  localTickets.forEach((localTicket) => {
+    const remoteTicket = ticketMap.get(localTicket.id);
+    if (!remoteTicket) {
+      ticketMap.set(localTicket.id, localTicket);
+      changed = true;
+      return;
+    }
+
+    const remoteUpdatedAt = Math.max(Number(remoteTicket.updatedAt) || 0, Number(remoteTicket.createdAt) || 0);
+    const localUpdatedAt = Math.max(Number(localTicket.updatedAt) || 0, Number(localTicket.createdAt) || 0);
+    const mergedMessages = mergeTicketMessages(remoteTicket.messages, localTicket.messages);
+    const messagesChanged = !areTicketMessageListsEqual(normalizeTicketMessages(remoteTicket.messages), mergedMessages);
+
+    let candidate = remoteTicket;
+    if (localUpdatedAt > remoteUpdatedAt) {
+      candidate = { ...remoteTicket, ...localTicket };
+      changed = true;
+    }
+    if (messagesChanged) {
+      candidate = { ...candidate, messages: mergedMessages };
+      changed = true;
+    }
+
+    const latestMessageTs = mergedMessages.length > 0
+      ? Math.max(...mergedMessages.map((message) => Number(message.timestamp) || 0))
+      : 0;
+    const candidateUpdatedAt = Math.max(
+      Number(candidate.updatedAt) || 0,
+      Number(candidate.createdAt) || 0,
+      remoteUpdatedAt,
+      localUpdatedAt,
+      latestMessageTs
+    );
+    ticketMap.set(localTicket.id, normalizeTicket({ ...candidate, updatedAt: candidateUpdatedAt, messages: mergedMessages }));
+  });
+
+  const mergedTickets = Array.from(ticketMap.values()).map(normalizeTicket);
+  if (mergedTickets.length !== remoteTickets.length) {
+    changed = true;
+  }
+  return { tickets: mergedTickets, changed };
+}
+
+function mergeLogsWithLocalData(remoteLogsRaw, localLogsRaw) {
+  const remoteLogs = Array.isArray(remoteLogsRaw) ? remoteLogsRaw.map(normalizeLogEntry) : [];
+  const localLogs = Array.isArray(localLogsRaw) ? localLogsRaw.map(normalizeLogEntry) : [];
+  const logMap = new Map();
+  remoteLogs.forEach((entry) => {
+    logMap.set(`${entry.timestamp}:${entry.user}:${entry.action}`, entry);
+  });
+
+  let changed = false;
+  localLogs.forEach((entry) => {
+    const key = `${entry.timestamp}:${entry.user}:${entry.action}`;
+    if (!logMap.has(key)) {
+      changed = true;
+    }
+    logMap.set(key, entry);
+  });
+
+  const mergedLogs = capLogs(Array.from(logMap.values()).sort((a, b) => a.timestamp - b.timestamp));
+  if (mergedLogs.length !== remoteLogs.length) {
+    changed = true;
+  }
+  return { logs: mergedLogs, changed };
+}
+
+function mergeTasksWithLocalData(remoteTasksRaw, localTasksRaw) {
+  const remoteTasks = Array.isArray(remoteTasksRaw) ? remoteTasksRaw.map(normalizeTask) : [];
+  const localTasks = Array.isArray(localTasksRaw) ? localTasksRaw.map(normalizeTask) : [];
+  const taskMap = new Map();
+  remoteTasks.forEach((task) => {
+    taskMap.set(task.id, task);
+  });
+
+  let changed = false;
+  localTasks.forEach((localTask) => {
+    const remoteTask = taskMap.get(localTask.id);
+    if (!remoteTask) {
+      taskMap.set(localTask.id, localTask);
+      changed = true;
+      return;
+    }
+    const remoteUpdatedAt = Math.max(Number(remoteTask.updatedAt) || 0, Number(remoteTask.createdAt) || 0);
+    const localUpdatedAt = Math.max(Number(localTask.updatedAt) || 0, Number(localTask.createdAt) || 0);
+    if (localUpdatedAt > remoteUpdatedAt) {
+      taskMap.set(localTask.id, localTask);
+      changed = true;
+    }
+  });
+
+  const mergedTasks = Array.from(taskMap.values()).map(normalizeTask);
+  if (mergedTasks.length !== remoteTasks.length) {
+    changed = true;
+  }
+  return { tasks: mergedTasks, changed };
+}
+
+function mergeNotesWithLocalData(remoteNotesRaw, localNotesRaw) {
+  const remoteNotes = Array.isArray(remoteNotesRaw) ? remoteNotesRaw.map(normalizeNote) : [];
+  const localNotes = Array.isArray(localNotesRaw) ? localNotesRaw.map(normalizeNote) : [];
+  const noteMap = new Map();
+  remoteNotes.forEach((note) => {
+    noteMap.set(note.id, note);
+  });
+
+  let changed = false;
+  localNotes.forEach((localNote) => {
+    const remoteNote = noteMap.get(localNote.id);
+    if (!remoteNote) {
+      noteMap.set(localNote.id, localNote);
+      changed = true;
+      return;
+    }
+    const remoteUpdatedAt = Number(remoteNote.updatedAt) || 0;
+    const localUpdatedAt = Number(localNote.updatedAt) || 0;
+    if (localUpdatedAt > remoteUpdatedAt) {
+      noteMap.set(localNote.id, localNote);
+      changed = true;
+    }
+  });
+
+  const mergedNotes = Array.from(noteMap.values()).map(normalizeNote);
+  if (mergedNotes.length !== remoteNotes.length) {
+    changed = true;
+  }
+  return { notes: mergedNotes, changed };
+}
+
+function mergeAnnouncementsWithLocalData(remoteAnnouncementsRaw, localAnnouncementsRaw) {
+  const remoteAnnouncements = Array.isArray(remoteAnnouncementsRaw) ? remoteAnnouncementsRaw.map(normalizeAnnouncement) : [];
+  const localAnnouncements = Array.isArray(localAnnouncementsRaw) ? localAnnouncementsRaw.map(normalizeAnnouncement) : [];
+  const announcementMap = new Map();
+  remoteAnnouncements.forEach((item) => {
+    announcementMap.set(item.id, item);
+  });
+
+  let changed = false;
+  localAnnouncements.forEach((localItem) => {
+    const remoteItem = announcementMap.get(localItem.id);
+    if (!remoteItem) {
+      announcementMap.set(localItem.id, localItem);
+      changed = true;
+      return;
+    }
+    if ((Number(localItem.createdAt) || 0) > (Number(remoteItem.createdAt) || 0)) {
+      announcementMap.set(localItem.id, localItem);
+      changed = true;
+    }
+  });
+
+  const mergedAnnouncements = Array.from(announcementMap.values()).map(normalizeAnnouncement);
+  if (mergedAnnouncements.length !== remoteAnnouncements.length) {
+    changed = true;
+  }
+  return { announcements: mergedAnnouncements, changed };
+}
+
 function normalizeStaffChatMessages(rawMessages) {
   const source = Array.isArray(rawMessages) ? rawMessages : [];
   const normalized = source
@@ -884,6 +1259,110 @@ function normalizeStaffChatMessages(rawMessages) {
   return unique.slice(-STAFF_CHAT_MAX_MESSAGES);
 }
 
+function normalizeWalletAutomationSettings(rawSettings) {
+  const source = rawSettings && typeof rawSettings === 'object' && !Array.isArray(rawSettings) ? rawSettings : {};
+  const parsedDueDay = Number(source.dueDay);
+  const dueDay = Number.isFinite(parsedDueDay)
+    ? Math.max(1, Math.min(28, Math.floor(parsedDueDay)))
+    : DEFAULT_WALLET_AUTOMATION_SETTINGS.dueDay;
+  const parsedGraceDays = Number(source.graceDays);
+  const graceDays = Number.isFinite(parsedGraceDays)
+    ? Math.max(0, Math.min(45, Math.floor(parsedGraceDays)))
+    : DEFAULT_WALLET_AUTOMATION_SETTINGS.graceDays;
+  const parsedFineValue = Number(source.fineValue);
+  const fineValue = Number.isFinite(parsedFineValue)
+    ? Math.max(0, Math.min(100000, Number(parsedFineValue.toFixed(2))))
+    : DEFAULT_WALLET_AUTOMATION_SETTINGS.fineValue;
+  const parsedInterestMonthly = Number(source.interestMonthlyPercent);
+  const interestMonthlyPercent = Number.isFinite(parsedInterestMonthly)
+    ? Math.max(0, Math.min(100, Number(parsedInterestMonthly.toFixed(2))))
+    : DEFAULT_WALLET_AUTOMATION_SETTINGS.interestMonthlyPercent;
+  const parsedInterestCap = Number(source.interestCapPercent);
+  const interestCapPercent = Number.isFinite(parsedInterestCap)
+    ? Math.max(0, Math.min(400, Number(parsedInterestCap.toFixed(2))))
+    : DEFAULT_WALLET_AUTOMATION_SETTINGS.interestCapPercent;
+  const parsedMinDebt = Number(source.minDebtForLateCharge);
+  const minDebtForLateCharge = Number.isFinite(parsedMinDebt)
+    ? Math.max(0, Math.min(1000000, Number(parsedMinDebt.toFixed(2))))
+    : DEFAULT_WALLET_AUTOMATION_SETTINGS.minDebtForLateCharge;
+  const fineMode = BILLING_FINE_MODES.includes(source.fineMode)
+    ? source.fineMode
+    : DEFAULT_WALLET_AUTOMATION_SETTINGS.fineMode;
+  const lastRunDay = /^\d{4}-\d{2}-\d{2}$/.test(String(source.lastRunDay || '').trim())
+    ? String(source.lastRunDay).trim()
+    : '';
+  const updatedAt = Math.max(0, Number(source.updatedAt) || 0);
+  return {
+    enabled: Boolean(source.enabled),
+    dueDay,
+    graceDays,
+    fineMode,
+    fineValue,
+    interestMonthlyPercent,
+    interestCapPercent,
+    minDebtForLateCharge,
+    applyToBlockedUsers: Boolean(source.applyToBlockedUsers),
+    autoRunOnWalletControlOpen: Boolean(source.autoRunOnWalletControlOpen),
+    lastRunDay,
+    updatedAt
+  };
+}
+
+function normalizeUserBillingProfile(rawProfile, fallbackUpdatedAt = 0) {
+  const source = rawProfile && typeof rawProfile === 'object' && !Array.isArray(rawProfile) ? rawProfile : {};
+  const parseOptionalInt = (value, min, max) => {
+    if (value === null || value === undefined || String(value).trim() === '') return null;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return null;
+    return Math.max(min, Math.min(max, Math.floor(parsed)));
+  };
+  const parseOptionalAmount = (value, min = 0, max = 1000000) => {
+    if (value === null || value === undefined || String(value).trim() === '') return null;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return null;
+    return Math.max(min, Math.min(max, Number(parsed.toFixed(2))));
+  };
+
+  const dueDay = parseOptionalInt(source.dueDay, 1, 28);
+  const graceDays = parseOptionalInt(source.graceDays, 0, 45);
+  const fineMode = ['default', ...BILLING_FINE_MODES].includes(source.fineMode) ? source.fineMode : 'default';
+  const fineValue = parseOptionalAmount(source.fineValue, 0, 100000);
+  const interestMonthlyPercent = parseOptionalAmount(source.interestMonthlyPercent, 0, 100);
+  const interestCapPercent = parseOptionalAmount(source.interestCapPercent, 0, 400);
+  const minDebtForLateCharge = parseOptionalAmount(source.minDebtForLateCharge, 0, 1000000);
+  const lateCycleKey = /^\d{4}-\d{2}-\d{2}$/.test(String(source.lateCycleKey || '').trim())
+    ? String(source.lateCycleKey).trim()
+    : '';
+  const fineAppliedCycleKey = /^\d{4}-\d{2}-\d{2}$/.test(String(source.fineAppliedCycleKey || '').trim())
+    ? String(source.fineAppliedCycleKey).trim()
+    : '';
+  const lastAppliedDay = /^\d{4}-\d{2}-\d{2}$/.test(String(source.lastAppliedDay || '').trim())
+    ? String(source.lastAppliedDay).trim()
+    : '';
+  const lateAccruedDays = Math.max(0, Math.floor(Number(source.lateAccruedDays) || 0));
+  const cyclePrincipal = Math.max(0, Number(source.cyclePrincipal) || 0);
+  const cycleInterestAccrued = Math.max(0, Number(source.cycleInterestAccrued) || 0);
+  const updatedAt = Math.max(0, Number(source.updatedAt) || Number(fallbackUpdatedAt) || 0);
+
+  return {
+    dueDay,
+    graceDays,
+    fineMode,
+    fineValue,
+    interestMonthlyPercent,
+    interestCapPercent,
+    minDebtForLateCharge,
+    paused: Boolean(source.paused),
+    lateCycleKey,
+    fineAppliedCycleKey,
+    lateAccruedDays,
+    cyclePrincipal,
+    cycleInterestAccrued,
+    lastAppliedDay,
+    updatedAt
+  };
+}
+
 function normalizeSettings(rawSettings) {
   const source = rawSettings && typeof rawSettings === 'object' && !Array.isArray(rawSettings) ? rawSettings : {};
   const monthCandidate = String(source.walletDashboardMonth || '').trim();
@@ -901,7 +1380,8 @@ function normalizeSettings(rawSettings) {
     walletDashboardMonth: safeMonth,
     memberPrivateChatDailyLimit,
     customRoles,
-    staffChatMessages: normalizeStaffChatMessages(source.staffChatMessages)
+    staffChatMessages: normalizeStaffChatMessages(source.staffChatMessages),
+    walletAutomation: normalizeWalletAutomationSettings(source.walletAutomation)
   };
 }
 
@@ -930,18 +1410,21 @@ function ensureCoreUsers() {
   }
 
   const requiredUsers = [
-    { username: 'esther', password: DEFAULT_PASSWORD, role: 'superadmin' },
-    { username: 'belle', password: DEFAULT_PASSWORD, role: 'admin' },
-    { username: 'felps', password: DEFAULT_PASSWORD, role: 'member' },
-    { username: 'yoon', password: DEFAULT_PASSWORD, role: 'member' },
-    { username: 'murilo', password: DEFAULT_PASSWORD, role: 'member' },
-    { username: 'matheus', password: DEFAULT_PASSWORD, role: 'member' },
-    { username: 'inteligencia tp', password: DEFAULT_PASSWORD, role: 'inteligencia' }
+    { username: 'esther', password: DEFAULT_PASSWORD, role: 'superadmin', lockedRole: true },
+    { username: 'belle', password: DEFAULT_PASSWORD, role: 'admin', lockedRole: false },
+    { username: 'felps', password: DEFAULT_PASSWORD, role: 'member', lockedRole: false },
+    { username: 'yoon', password: DEFAULT_PASSWORD, role: 'member', lockedRole: false },
+    { username: 'murilo', password: DEFAULT_PASSWORD, role: 'member', lockedRole: false },
+    { username: 'matheus', password: DEFAULT_PASSWORD, role: 'member', lockedRole: false },
+    { username: 'inteligencia tp', password: DEFAULT_PASSWORD, role: 'inteligencia', lockedRole: true }
   ];
 
   requiredUsers.forEach((seed) => {
     const existing = users.find((user) => user.username.toLowerCase() === seed.username.toLowerCase());
     if (!existing) {
+      if (!seed.lockedRole) {
+        return;
+      }
       users.push(
         normalizeUser({
           username: seed.username,
@@ -958,19 +1441,9 @@ function ensureCoreUsers() {
       existing.password = seed.password;
       existing.passwordUpdatedAt = Math.max(Number(existing.passwordUpdatedAt) || 0, now);
     }
-    if (seed.username === 'esther') {
-      if (existing.role !== 'superadmin') {
-        existing.role = 'superadmin';
-        existing.roleUpdatedAt = Math.max(Number(existing.roleUpdatedAt) || 0, now);
-      }
-      if (existing.status !== 'active') {
-        existing.status = 'active';
-        existing.statusUpdatedAt = Math.max(Number(existing.statusUpdatedAt) || 0, now);
-      }
-    }
-    if (seed.username === 'inteligencia tp') {
-      if (existing.role !== 'inteligencia') {
-        existing.role = 'inteligencia';
+    if (seed.lockedRole) {
+      if (existing.role !== seed.role) {
+        existing.role = seed.role;
         existing.roleUpdatedAt = Math.max(Number(existing.roleUpdatedAt) || 0, now);
       }
       if (existing.status !== 'active') {
@@ -1026,6 +1499,22 @@ function getPresenceSocketCandidates() {
 }
 
 function refreshPresenceDependentViews() {
+  const now = Date.now();
+  const elapsed = now - lastPresenceViewRefreshAt;
+  if (elapsed < PRESENCE_VIEW_REFRESH_MIN_MS) {
+    if (!presenceViewRefreshTimer) {
+      presenceViewRefreshTimer = setTimeout(() => {
+        presenceViewRefreshTimer = null;
+        refreshPresenceDependentViews();
+      }, Math.max(120, PRESENCE_VIEW_REFRESH_MIN_MS - elapsed));
+    }
+    return;
+  }
+  lastPresenceViewRefreshAt = now;
+  if (presenceViewRefreshTimer) {
+    clearTimeout(presenceViewRefreshTimer);
+    presenceViewRefreshTimer = null;
+  }
   if (currentPage === 'intelCenter') {
     renderIntelCenter();
     return;
@@ -1049,6 +1538,22 @@ function collectAppStateForSync() {
     announcements,
     settings
   };
+}
+
+function getAppStateSyncHash(state) {
+  if (!state || typeof state !== 'object' || Array.isArray(state)) return '';
+  let serialized = '';
+  try {
+    serialized = JSON.stringify(state);
+  } catch {
+    return '';
+  }
+  let hash = 2166136261;
+  for (let i = 0; i < serialized.length; i += 1) {
+    hash ^= serialized.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${serialized.length}:${(hash >>> 0).toString(16)}`;
 }
 
 function isAppStateEffectivelyEmpty(state) {
@@ -1077,9 +1582,7 @@ function mergeLocalUsersIntoRemoteState(remoteUsersRaw, localUsersRaw) {
 
     const existingIndex = userIndexByName.get(key);
     if (typeof existingIndex !== 'number') {
-      mergedUsers.push(normalizeUser(localUser));
-      userIndexByName.set(key, mergedUsers.length - 1);
-      changed = true;
+      // Do not resurrect users that were removed remotely.
       return;
     }
 
@@ -1092,7 +1595,9 @@ function mergeLocalUsersIntoRemoteState(remoteUsersRaw, localUsersRaw) {
       { field: 'password', ts: 'passwordUpdatedAt' },
       { field: 'role', ts: 'roleUpdatedAt' },
       { field: 'privateChatDailyLimit', ts: 'privateChatLimitUpdatedAt' },
-      { field: 'walletHealth', ts: 'walletHealthUpdatedAt' }
+      { field: 'walletHealth', ts: 'walletHealthUpdatedAt' },
+      { field: 'walletChartEnabled', ts: 'walletChartUpdatedAt' },
+      { field: 'billingProfile', ts: 'billingUpdatedAt' }
     ];
 
     fieldByTimestamp.forEach(({ field, ts }) => {
@@ -1151,11 +1656,6 @@ function mergeLocalUsersIntoRemoteState(remoteUsersRaw, localUsersRaw) {
       localMerged = true;
     }
 
-    if (localUser.walletChartEnabled !== remoteUser.walletChartEnabled && localUser.role === remoteUser.role) {
-      remoteUser.walletChartEnabled = localUser.walletChartEnabled;
-      localMerged = true;
-    }
-
     if (localMerged) {
       changed = true;
       mergedUsers[existingIndex] = normalizeUser(remoteUser);
@@ -1208,6 +1708,12 @@ function mergeIncomingAppStateWithLocal(rawRemoteState, localState) {
     remoteSettings.staffChatMessages = mergedStaffChat;
     changed = true;
   }
+  const remoteWalletAutomationTs = Math.max(0, Number(remoteSettings.walletAutomation && remoteSettings.walletAutomation.updatedAt) || 0);
+  const localWalletAutomationTs = Math.max(0, Number(localSettings.walletAutomation && localSettings.walletAutomation.updatedAt) || 0);
+  if (localWalletAutomationTs > remoteWalletAutomationTs) {
+    remoteSettings.walletAutomation = normalizeWalletAutomationSettings(localSettings.walletAutomation);
+    changed = true;
+  }
   mergedState.settings = remoteSettings;
 
   // Normalize users using merged role definitions, avoiding custom-role downgrades.
@@ -1217,6 +1723,29 @@ function mergeIncomingAppStateWithLocal(rawRemoteState, localState) {
   settings = previousSettings;
   mergedState.users = mergedUsersResult.users;
   changed = changed || mergedUsersResult.changed;
+
+  const mergedTicketsResult = mergeTicketsWithLocalData(mergedState.tickets, safeLocalState.tickets);
+  mergedState.tickets = mergedTicketsResult.tickets;
+  changed = changed || mergedTicketsResult.changed;
+
+  const mergedLogsResult = mergeLogsWithLocalData(mergedState.logs, safeLocalState.logs);
+  mergedState.logs = mergedLogsResult.logs;
+  changed = changed || mergedLogsResult.changed;
+
+  const mergedTasksResult = mergeTasksWithLocalData(mergedState.tasks, safeLocalState.tasks);
+  mergedState.tasks = mergedTasksResult.tasks;
+  changed = changed || mergedTasksResult.changed;
+
+  const mergedNotesResult = mergeNotesWithLocalData(mergedState.notes, safeLocalState.notes);
+  mergedState.notes = mergedNotesResult.notes;
+  changed = changed || mergedNotesResult.changed;
+
+  const mergedAnnouncementsResult = mergeAnnouncementsWithLocalData(
+    mergedState.announcements,
+    safeLocalState.announcements
+  );
+  mergedState.announcements = mergedAnnouncementsResult.announcements;
+  changed = changed || mergedAnnouncementsResult.changed;
 
   return { state: mergedState, changed };
 }
@@ -1238,6 +1767,14 @@ function scheduleAppStateSync() {
   appStateSyncTimer = setTimeout(() => {
     appStateSyncTimer = null;
     const state = collectAppStateForSync();
+    const nextHash = getAppStateSyncHash(state);
+    if (nextHash && nextHash === lastSentAppStateHash) {
+      wsDebugLog('skip app_state_sync unchanged');
+      return;
+    }
+    if (nextHash) {
+      lastSentAppStateHash = nextHash;
+    }
     wsDebugLog('send app_state_sync', {
       users: Array.isArray(state.users) ? state.users.length : 0,
       tickets: Array.isArray(state.tickets) ? state.tickets.length : 0,
@@ -1253,6 +1790,7 @@ function scheduleAppStateSync() {
 }
 
 function persistLocalDataOnly() {
+  logs = capLogs(logs.map(normalizeLogEntry));
   localStorage.setItem(STORAGE_KEYS.users, JSON.stringify(users));
   localStorage.setItem(STORAGE_KEYS.tickets, JSON.stringify(tickets));
   localStorage.setItem(STORAGE_KEYS.logs, JSON.stringify(logs));
@@ -1264,34 +1802,49 @@ function persistLocalDataOnly() {
 
 function applySyncedAppState(rawState, options = {}) {
   if (!rawState || typeof rawState !== 'object' || Array.isArray(rawState)) return false;
-  remoteStateApplying = true;
-  settings = normalizeSettings(rawState.settings || settings);
-  users = Array.isArray(rawState.users) ? rawState.users.map(normalizeUser) : users;
-  tickets = Array.isArray(rawState.tickets) ? rawState.tickets.map(normalizeTicket) : tickets;
-  logs = Array.isArray(rawState.logs)
-    ? rawState.logs.map((log) => ({
-        timestamp: Number(log.timestamp) || Date.now(),
-        user: String(log.user || 'sistema'),
-        action: String(log.action || 'acao nao informada')
-      }))
-    : logs;
-  tasks = Array.isArray(rawState.tasks) ? rawState.tasks.map(normalizeTask) : tasks;
-  notes = Array.isArray(rawState.notes) ? rawState.notes.map(normalizeNote) : notes;
-  announcements = Array.isArray(rawState.announcements) ? rawState.announcements.map(normalizeAnnouncement) : announcements;
-  ensureCoreUsers();
-  if (session && !getCurrentUser()) {
-    users.push(
-      normalizeUser({
-        username: session.username,
-        password: DEFAULT_PASSWORD,
-        role: session.role || 'member',
-        status: 'active',
-        debt: 0
-      })
-    );
+  const incomingHash = getAppStateSyncHash(rawState);
+  const localBeforeHash = getAppStateSyncHash(collectAppStateForSync());
+  if (incomingHash && incomingHash === localBeforeHash) {
+    lastAppliedAppStateHash = incomingHash;
+    return false;
   }
-  persistLocalDataOnly();
-  remoteStateApplying = false;
+  if (incomingHash && incomingHash === lastAppliedAppStateHash) {
+    return false;
+  }
+  remoteStateApplying = true;
+  try {
+    pendingSaveDataFlush = false;
+    settings = normalizeSettings(rawState.settings || settings);
+    users = Array.isArray(rawState.users) ? rawState.users.map(normalizeUser) : users;
+    tickets = Array.isArray(rawState.tickets) ? rawState.tickets.map(normalizeTicket) : tickets;
+    logs = Array.isArray(rawState.logs)
+      ? capLogs(rawState.logs.map(normalizeLogEntry))
+      : logs;
+    tasks = Array.isArray(rawState.tasks) ? rawState.tasks.map(normalizeTask) : tasks;
+    notes = Array.isArray(rawState.notes) ? rawState.notes.map(normalizeNote) : notes;
+    announcements = Array.isArray(rawState.announcements) ? rawState.announcements.map(normalizeAnnouncement) : announcements;
+    ensureCoreUsers();
+    if (session && !getCurrentUser()) {
+      const sessionKey = String(session.username || '').trim().toLowerCase();
+      const canRestoreLockedUser = sessionKey === 'esther' || sessionKey === 'inteligencia tp';
+      if (canRestoreLockedUser) {
+        users.push(
+          normalizeUser({
+            username: session.username,
+            password: DEFAULT_PASSWORD,
+            role: session.role || 'member',
+            status: 'active',
+            debt: 0
+          })
+        );
+      }
+    }
+    persistLocalDataOnly();
+    syncSessionFromUsers({ source: 'app_state_sync', notify: true });
+    lastAppliedAppStateHash = incomingHash || getAppStateSyncHash(collectAppStateForSync());
+  } finally {
+    remoteStateApplying = false;
+  }
 
   if (options.render && session) {
     requestRealtimeRender();
@@ -1386,6 +1939,7 @@ function connectPresenceSocket() {
 
       if (payload.origin && payload.origin === SYNC_CLIENT_ID) {
         remoteStateInitialized = true;
+        lastAppliedAppStateHash = getAppStateSyncHash(payload.state);
         wsDebugLog('app_state_sync ack (self)');
         return;
       }
@@ -1397,6 +1951,10 @@ function connectPresenceSocket() {
       wsDebugLog('app_state_sync applied', payload.origin || 'remote');
 
       if (remoteLooksEmpty && localHasData) {
+        const seedHash = getAppStateSyncHash(localBefore);
+        if (seedHash) {
+          lastSentAppStateHash = seedHash;
+        }
         sendPresenceSocketMessage({
           type: 'app_state_sync',
           origin: SYNC_CLIENT_ID,
@@ -1405,11 +1963,20 @@ function connectPresenceSocket() {
         });
         applySyncedAppState(localBefore, { render: true });
       } else if (mergedStateResult.changed) {
+        const mergedState = collectAppStateForSync();
+        const mergedHash = getAppStateSyncHash(mergedState);
+        if (mergedHash && mergedHash === lastSentAppStateHash) {
+          wsDebugLog('skip app_state_sync merge unchanged');
+          return;
+        }
+        if (mergedHash) {
+          lastSentAppStateHash = mergedHash;
+        }
         sendPresenceSocketMessage({
           type: 'app_state_sync',
           origin: SYNC_CLIENT_ID,
           merge: true,
-          state: collectAppStateForSync()
+          state: mergedState
         });
       }
       return;
@@ -1601,6 +2168,7 @@ function registerUserAccess(user) {
     user: user.username,
     action: `Entrou no site (${roleLabel(user.role)}), acesso #${user.accessCount}`
   });
+  logs = capLogs(logs);
 }
 
 function registerUserOffline(username, reason = 'saida') {
@@ -1615,6 +2183,7 @@ function registerUserOffline(username, reason = 'saida') {
     user: user.username,
     action: `Saiu do site (${reason}) apos ${formatDuration(sessionMs)} online`
   });
+  logs = capLogs(logs);
   saveData();
 }
 
@@ -1847,6 +2416,432 @@ function promptFinanceTimestamp(actionLabel) {
   return { cancelled: false, timestamp: parsed, custom: true };
 }
 
+function getWalletAutomationSettings() {
+  settings.walletAutomation = normalizeWalletAutomationSettings(settings.walletAutomation);
+  return settings.walletAutomation;
+}
+
+function ensureUserBillingProfile(user) {
+  if (!user) {
+    return normalizeUserBillingProfile({}, 0);
+  }
+  const normalized = normalizeUserBillingProfile(user.billingProfile, user.billingUpdatedAt);
+  user.billingProfile = normalized;
+  user.billingUpdatedAt = Math.max(0, Number(user.billingUpdatedAt) || 0, Number(normalized.updatedAt) || 0);
+  return normalized;
+}
+
+function getUserEffectiveBillingPolicy(user) {
+  const globalPolicy = getWalletAutomationSettings();
+  const profile = normalizeUserBillingProfile(user && user.billingProfile, user && user.billingUpdatedAt);
+  const pick = (value, fallback) => (value === null || value === undefined ? fallback : value);
+  const fineMode = profile.fineMode && profile.fineMode !== 'default'
+    ? profile.fineMode
+    : globalPolicy.fineMode;
+  return {
+    enabled: globalPolicy.enabled && !profile.paused,
+    dueDay: pick(profile.dueDay, globalPolicy.dueDay),
+    graceDays: pick(profile.graceDays, globalPolicy.graceDays),
+    fineMode,
+    fineValue: pick(profile.fineValue, globalPolicy.fineValue),
+    interestMonthlyPercent: pick(profile.interestMonthlyPercent, globalPolicy.interestMonthlyPercent),
+    interestCapPercent: pick(profile.interestCapPercent, globalPolicy.interestCapPercent),
+    minDebtForLateCharge: pick(profile.minDebtForLateCharge, globalPolicy.minDebtForLateCharge),
+    applyToBlockedUsers: globalPolicy.applyToBlockedUsers,
+    autoRunOnWalletControlOpen: globalPolicy.autoRunOnWalletControlOpen,
+    profilePaused: profile.paused
+  };
+}
+
+function getStartOfDayTimestamp(timestamp = Date.now()) {
+  const date = new Date(Number(timestamp) || Date.now());
+  date.setHours(0, 0, 0, 0);
+  return date.getTime();
+}
+
+function getDaysInMonth(year, monthIndex) {
+  return new Date(year, monthIndex + 1, 0).getDate();
+}
+
+function getLatestBillingDueTimestamp(referenceTs = Date.now(), dueDay = DEFAULT_WALLET_AUTOMATION_SETTINGS.dueDay) {
+  const safeDueDay = Math.max(1, Math.min(28, Math.floor(Number(dueDay) || DEFAULT_WALLET_AUTOMATION_SETTINGS.dueDay)));
+  const referenceDate = new Date(Number(referenceTs) || Date.now());
+  const year = referenceDate.getFullYear();
+  const month = referenceDate.getMonth();
+  const currentDueDay = Math.min(safeDueDay, getDaysInMonth(year, month));
+  const currentDueTs = new Date(year, month, currentDueDay, 0, 0, 0, 0).getTime();
+  if (referenceTs >= currentDueTs) return currentDueTs;
+  const prevDate = new Date(year, month - 1, 1);
+  const prevYear = prevDate.getFullYear();
+  const prevMonth = prevDate.getMonth();
+  const prevDueDay = Math.min(safeDueDay, getDaysInMonth(prevYear, prevMonth));
+  return new Date(prevYear, prevMonth, prevDueDay, 0, 0, 0, 0).getTime();
+}
+
+function calculateUserLateChargePreview(user, referenceTs = Date.now()) {
+  const referenceDayTs = getStartOfDayTimestamp(referenceTs);
+  if (!user || user.role !== 'member') {
+    return {
+      eligible: false,
+      reason: 'Somente membros entram na regra.',
+      totalAmount: 0,
+      fineAmount: 0,
+      interestAmount: 0,
+      overdueDays: 0,
+      overdueAfterGrace: 0,
+      dueTimestamp: referenceDayTs,
+      dueDayKey: getDayKeyFromTimestamp(referenceDayTs),
+      newInterestDays: 0,
+      cyclePrincipal: 0,
+      interestCapAmount: 0,
+      profilePaused: false
+    };
+  }
+
+  const profile = ensureUserBillingProfile(user);
+  const policy = getUserEffectiveBillingPolicy(user);
+  const globalPolicy = getWalletAutomationSettings();
+  const debt = Math.max(0, Number(user.debt) || 0);
+
+  if (!policy.enabled) {
+    const reason = globalPolicy.enabled
+      ? 'Automacao pausada para este membro.'
+      : 'Automacao global desativada.';
+    return {
+      eligible: false,
+      reason,
+      totalAmount: 0,
+      fineAmount: 0,
+      interestAmount: 0,
+      overdueDays: 0,
+      overdueAfterGrace: 0,
+      dueTimestamp: referenceDayTs,
+      dueDayKey: getDayKeyFromTimestamp(referenceDayTs),
+      newInterestDays: 0,
+      cyclePrincipal: 0,
+      interestCapAmount: 0,
+      profilePaused: Boolean(policy.profilePaused)
+    };
+  }
+
+  if (user.status !== 'active' && !policy.applyToBlockedUsers) {
+    return {
+      eligible: false,
+      reason: 'Usuario bloqueado (sem permissao de auto-cobranca).',
+      totalAmount: 0,
+      fineAmount: 0,
+      interestAmount: 0,
+      overdueDays: 0,
+      overdueAfterGrace: 0,
+      dueTimestamp: referenceDayTs,
+      dueDayKey: getDayKeyFromTimestamp(referenceDayTs),
+      newInterestDays: 0,
+      cyclePrincipal: 0,
+      interestCapAmount: 0,
+      profilePaused: false
+    };
+  }
+
+  if (debt < policy.minDebtForLateCharge) {
+    return {
+      eligible: false,
+      reason: `Divida abaixo do minimo (${formatCurrency(policy.minDebtForLateCharge)}).`,
+      totalAmount: 0,
+      fineAmount: 0,
+      interestAmount: 0,
+      overdueDays: 0,
+      overdueAfterGrace: 0,
+      dueTimestamp: referenceDayTs,
+      dueDayKey: getDayKeyFromTimestamp(referenceDayTs),
+      newInterestDays: 0,
+      cyclePrincipal: 0,
+      interestCapAmount: 0,
+      profilePaused: false
+    };
+  }
+
+  const dueTimestamp = getLatestBillingDueTimestamp(referenceDayTs, policy.dueDay);
+  const dueDayKey = getDayKeyFromTimestamp(dueTimestamp);
+  const overdueDays = Math.max(0, Math.floor((referenceDayTs - dueTimestamp) / (24 * 60 * 60 * 1000)));
+  const overdueAfterGrace = Math.max(0, overdueDays - policy.graceDays);
+  const sameCycle = profile.lateCycleKey === dueDayKey;
+  const accruedDaysBefore = sameCycle ? Math.max(0, Number(profile.lateAccruedDays) || 0) : 0;
+  const interestAccruedBefore = sameCycle ? Math.max(0, Number(profile.cycleInterestAccrued) || 0) : 0;
+  const cyclePrincipal = sameCycle
+    ? Math.max(0, Number(profile.cyclePrincipal) || debt)
+    : debt;
+  const fineAlreadyApplied = profile.fineAppliedCycleKey === dueDayKey;
+
+  if (overdueAfterGrace <= 0) {
+    return {
+      eligible: false,
+      reason: 'Ainda dentro da tolerancia de vencimento.',
+      totalAmount: 0,
+      fineAmount: 0,
+      interestAmount: 0,
+      overdueDays,
+      overdueAfterGrace,
+      dueTimestamp,
+      dueDayKey,
+      newInterestDays: 0,
+      cyclePrincipal,
+      interestCapAmount: Number((cyclePrincipal * (policy.interestCapPercent / 100)).toFixed(2)),
+      profilePaused: false
+    };
+  }
+
+  const newInterestDays = Math.max(0, overdueAfterGrace - accruedDaysBefore);
+  let fineAmount = 0;
+  if (!fineAlreadyApplied) {
+    fineAmount = policy.fineMode === 'fixed'
+      ? Number(policy.fineValue) || 0
+      : debt * ((Number(policy.fineValue) || 0) / 100);
+  }
+  fineAmount = Number(Math.max(0, fineAmount).toFixed(2));
+
+  const dailyRate = (Math.max(0, Number(policy.interestMonthlyPercent) || 0) / 100) / 30;
+  const rawInterest = debt * dailyRate * newInterestDays;
+  const interestCapAmount = Math.max(0, cyclePrincipal * ((Number(policy.interestCapPercent) || 0) / 100));
+  const capRemaining = Math.max(0, interestCapAmount - interestAccruedBefore);
+  const interestAmount = Number(Math.max(0, Math.min(rawInterest, capRemaining)).toFixed(2));
+  const totalAmount = Number((fineAmount + interestAmount).toFixed(2));
+
+  let reason = '';
+  if (totalAmount <= 0) {
+    if (fineAlreadyApplied && newInterestDays <= 0) {
+      reason = 'Atraso ja processado para o ciclo atual.';
+    } else if (capRemaining <= 0) {
+      reason = 'Teto de juros do ciclo atingido.';
+    } else {
+      reason = 'Sem valor novo para aplicar.';
+    }
+  }
+
+  return {
+    eligible: totalAmount > 0,
+    reason,
+    totalAmount,
+    fineAmount,
+    interestAmount,
+    overdueDays,
+    overdueAfterGrace,
+    dueTimestamp,
+    dueDayKey,
+    fineAlreadyApplied,
+    newInterestDays,
+    accruedDaysBefore,
+    interestAccruedBefore: Number(interestAccruedBefore.toFixed(2)),
+    cyclePrincipal: Number(cyclePrincipal.toFixed(2)),
+    interestCapAmount: Number(interestCapAmount.toFixed(2)),
+    policy,
+    profilePaused: false
+  };
+}
+
+function applyLateChargesToUser(user, options = {}) {
+  const referenceTs = Number(options.referenceTs) > 0 ? Number(options.referenceTs) : Date.now();
+  const eventTimestamp = Number(options.eventTimestamp) > 0 ? Number(options.eventTimestamp) : referenceTs;
+  const actor = options.actor || (session ? session.username : 'sistema');
+  const skipSave = Boolean(options.skipSave);
+  const preview = calculateUserLateChargePreview(user, referenceTs);
+
+  if (!preview.eligible) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: preview.reason || 'Sem cobranca pendente.',
+      fineAmount: 0,
+      interestAmount: 0,
+      totalAmount: 0,
+      overdueDays: preview.overdueDays || 0
+    };
+  }
+
+  let appliedFine = 0;
+  let appliedInterest = 0;
+
+  if (preview.fineAmount > 0) {
+    const fineModeLabel = preview.policy && preview.policy.fineMode === 'fixed'
+      ? `${formatCurrency(preview.policy.fineValue)} fixo`
+      : `${Number(preview.policy && preview.policy.fineValue || 0).toFixed(2)}%`;
+    const fineResult = registerFinanceEvent(
+      user,
+      'charge',
+      preview.fineAmount,
+      `Multa de atraso (${fineModeLabel}) - ciclo ${preview.dueDayKey}`,
+      actor,
+      { timestamp: eventTimestamp, skipSave: true }
+    );
+    if (!fineResult.ok) {
+      return { ok: false, skipped: true, reason: fineResult.message || 'Falha ao aplicar multa.' };
+    }
+    appliedFine = fineResult.amount;
+  }
+
+  if (preview.interestAmount > 0) {
+    const interestResult = registerFinanceEvent(
+      user,
+      'charge',
+      preview.interestAmount,
+      `Juros de atraso ${Number(preview.policy && preview.policy.interestMonthlyPercent || 0).toFixed(2)}%/mes (${preview.newInterestDays} dia(s) novos) - ciclo ${preview.dueDayKey}`,
+      actor,
+      { timestamp: eventTimestamp, skipSave: true }
+    );
+    if (!interestResult.ok) {
+      return { ok: false, skipped: true, reason: interestResult.message || 'Falha ao aplicar juros.' };
+    }
+    appliedInterest = interestResult.amount;
+  }
+
+  const profile = ensureUserBillingProfile(user);
+  if (profile.lateCycleKey !== preview.dueDayKey) {
+    profile.lateCycleKey = preview.dueDayKey;
+    profile.lateAccruedDays = 0;
+    profile.cyclePrincipal = Math.max(0, Number(preview.cyclePrincipal) || Math.max(0, Number(user.debt) || 0));
+    profile.cycleInterestAccrued = 0;
+    profile.fineAppliedCycleKey = '';
+  }
+  profile.lateAccruedDays = Math.max(0, Number(preview.accruedDaysBefore) || 0) + Math.max(0, Number(preview.newInterestDays) || 0);
+  profile.cyclePrincipal = Math.max(0, Number(preview.cyclePrincipal) || 0);
+  profile.cycleInterestAccrued = Number((Math.max(0, Number(preview.interestAccruedBefore) || 0) + Math.max(0, appliedInterest)).toFixed(2));
+  if (appliedFine > 0 || preview.fineAlreadyApplied) {
+    profile.fineAppliedCycleKey = preview.dueDayKey;
+  }
+  profile.lastAppliedDay = getDayKeyFromTimestamp(referenceTs);
+  profile.updatedAt = Date.now();
+  user.billingUpdatedAt = profile.updatedAt;
+
+  if (!skipSave) {
+    saveData();
+  }
+
+  return {
+    ok: true,
+    skipped: false,
+    fineAmount: Number(appliedFine.toFixed(2)),
+    interestAmount: Number(appliedInterest.toFixed(2)),
+    totalAmount: Number((appliedFine + appliedInterest).toFixed(2)),
+    overdueDays: preview.overdueDays,
+    cycleKey: preview.dueDayKey
+  };
+}
+
+function buildLateChargeCandidates(scopedUsers = users, referenceTs = Date.now()) {
+  return scopedUsers
+    .filter((user) => user && user.role === 'member')
+    .map((user) => {
+      const preview = calculateUserLateChargePreview(user, referenceTs);
+      return {
+        username: user.username,
+        debt: Math.max(0, Number(user.debt) || 0),
+        status: user.status,
+        ...preview
+      };
+    })
+    .sort((a, b) => {
+      if (Number(b.totalAmount) !== Number(a.totalAmount)) return Number(b.totalAmount) - Number(a.totalAmount);
+      return String(a.username).localeCompare(String(b.username));
+    });
+}
+
+function runWalletLateAutomation(options = {}) {
+  const automation = getWalletAutomationSettings();
+  const actor = options.actor || (session ? session.username : 'sistema');
+  const referenceTs = Number(options.referenceTs) > 0 ? Number(options.referenceTs) : Date.now();
+  const dayKey = getDayKeyFromTimestamp(referenceTs);
+  const force = Boolean(options.force);
+  let temporaryEnabledOverride = false;
+
+  if (!automation.enabled && !force) {
+    return {
+      ok: false,
+      alreadyRun: false,
+      appliedCount: 0,
+      skippedCount: 0,
+      totalAmount: 0,
+      message: 'Automacao de atraso desativada.'
+    };
+  }
+
+  if (!force && automation.lastRunDay === dayKey) {
+    return {
+      ok: false,
+      alreadyRun: true,
+      appliedCount: 0,
+      skippedCount: 0,
+      totalAmount: 0,
+      message: 'Automacao ja executada hoje.'
+    };
+  }
+
+  if (force && !automation.enabled) {
+    settings.walletAutomation = normalizeWalletAutomationSettings({
+      ...automation,
+      enabled: true
+    });
+    temporaryEnabledOverride = true;
+  }
+
+  const members = users.filter((user) => user.role === 'member');
+  const candidates = buildLateChargeCandidates(members, referenceTs);
+  let appliedCount = 0;
+  let skippedCount = 0;
+  let totalAmount = 0;
+  const appliedUsers = [];
+
+  candidates.forEach((candidate) => {
+    const user = getUserByUsername(candidate.username);
+    if (!user) {
+      skippedCount += 1;
+      return;
+    }
+    const result = applyLateChargesToUser(user, {
+      referenceTs,
+      eventTimestamp: referenceTs,
+      actor,
+      skipSave: true
+    });
+    if (!result.ok) {
+      skippedCount += 1;
+      return;
+    }
+    appliedCount += 1;
+    totalAmount += Number(result.totalAmount) || 0;
+    appliedUsers.push({
+      username: user.username,
+      totalAmount: Number(result.totalAmount) || 0,
+      fineAmount: Number(result.fineAmount) || 0,
+      interestAmount: Number(result.interestAmount) || 0
+    });
+  });
+
+  const basePolicy = temporaryEnabledOverride ? automation : settings.walletAutomation;
+  settings.walletAutomation = normalizeWalletAutomationSettings({
+    ...basePolicy,
+    lastRunDay: dayKey,
+    updatedAt: Date.now()
+  });
+  saveData();
+
+  return {
+    ok: true,
+    alreadyRun: false,
+    appliedCount,
+    skippedCount,
+    totalAmount: Number(totalAmount.toFixed(2)),
+    appliedUsers,
+    message: appliedCount > 0
+      ? `Automacao aplicada em ${appliedCount} membro(s).`
+      : 'Nenhum membro elegivel para multa/juros agora.'
+  };
+}
+
+function formatBillingFineRule(mode, value) {
+  const safeValue = Number(value) || 0;
+  if (mode === 'fixed') return `${formatCurrency(safeValue)} fixo`;
+  return `${safeValue.toFixed(2)}%`;
+}
+
 function registerFinanceEvent(user, type, amount, note = '', actor = null, options = {}) {
   const safeAmount = toPositiveAmount(amount);
   if (!user || safeAmount <= 0) {
@@ -1856,6 +2851,7 @@ function registerFinanceEvent(user, type, amount, note = '', actor = null, optio
   const eventTimestamp = Number(options.timestamp) > 0 ? Number(options.timestamp) : Date.now();
   const entryActor = actor || (session ? session.username : 'sistema');
   const eventType = ['charge', 'payment', 'loan', 'adjustment'].includes(type) ? type : 'adjustment';
+  const shouldPersist = options.skipSave !== true;
   let appliedAmount = safeAmount;
 
   if (eventType === 'charge') {
@@ -1889,7 +2885,7 @@ function registerFinanceEvent(user, type, amount, note = '', actor = null, optio
     }
     user.financeUpdatedAt = Math.max(0, Number(user.financeUpdatedAt) || 0, eventTimestamp);
 
-    saveData();
+    if (shouldPersist) saveData();
     return {
       ok: true,
       amount: appliedAmount,
@@ -1918,7 +2914,7 @@ function registerFinanceEvent(user, type, amount, note = '', actor = null, optio
   }
   user.financeUpdatedAt = Math.max(0, Number(user.financeUpdatedAt) || 0, eventTimestamp);
 
-  saveData();
+  if (shouldPersist) saveData();
   return { ok: true, amount: appliedAmount, timestamp: eventTimestamp, message: 'Operacao registrada.' };
 }
 
@@ -2345,18 +3341,36 @@ function drawFinanceSeriesCanvas(canvas, series, options = {}) {
 
 function drawFinanceSeriesCanvasAnimated(canvas, series, options = {}) {
   if (!canvas || !series) return;
+  const previousRaf = chartAnimationRafByCanvas.get(canvas);
+  if (previousRaf) {
+    window.cancelAnimationFrame(previousRaf);
+  }
   const duration = Math.max(240, Number(options.durationMs) || 780);
   const start = performance.now();
+  let active = true;
 
   function frame(now) {
+    if (!active) return;
     const progress = Math.min(1, (now - start) / duration);
     drawFinanceSeriesCanvas(canvas, series, { ...options, progress });
     if (progress < 1) {
-      requestAnimationFrame(frame);
+      const rafId = requestAnimationFrame(frame);
+      chartAnimationRafByCanvas.set(canvas, rafId);
+      return;
     }
+    chartAnimationRafByCanvas.delete(canvas);
   }
 
-  requestAnimationFrame(frame);
+  const rafId = requestAnimationFrame(frame);
+  chartAnimationRafByCanvas.set(canvas, rafId);
+  return () => {
+    active = false;
+    const running = chartAnimationRafByCanvas.get(canvas);
+    if (running) {
+      window.cancelAnimationFrame(running);
+      chartAnimationRafByCanvas.delete(canvas);
+    }
+  };
 }
 
 function drawWalletCanvas(canvas, user, optionsOrMonth = getCurrentMonthKey()) {
@@ -2375,7 +3389,7 @@ function drawWalletCanvas(canvas, user, optionsOrMonth = getCurrentMonthKey()) {
     paidFill: options.paidFill || 'rgba(38, 226, 177, 0.18)',
     debtFill: options.debtFill || 'rgba(108, 180, 255, 0.16)'
   };
-  if (options.animate === false) {
+  if (options.animate !== true) {
     drawFinanceSeriesCanvas(canvas, series, chartOptions);
     return;
   }
@@ -2464,9 +3478,32 @@ function bindChartDetails(canvas, series, outputEl, options = {}) {
   });
 }
 
-function saveData() {
+function commitDataPersistence() {
   persistLocalDataOnly();
   scheduleAppStateSync();
+}
+
+function flushPendingSaveData() {
+  if (!pendingSaveDataFlush) return;
+  pendingSaveDataFlush = false;
+  commitDataPersistence();
+}
+
+function saveData(options = {}) {
+  if (options && options.immediate === true) {
+    if (pendingSaveDataFlush) {
+      flushPendingSaveData();
+    } else {
+      commitDataPersistence();
+    }
+    return;
+  }
+
+  if (pendingSaveDataFlush) return;
+  pendingSaveDataFlush = true;
+  Promise.resolve().then(() => {
+    flushPendingSaveData();
+  });
 }
 
 function addLog(action) {
@@ -2475,6 +3512,7 @@ function addLog(action) {
     user: session ? session.username : 'sistema',
     action: String(action || 'acao sem descricao')
   });
+  logs = capLogs(logs);
   saveData();
 }
 
@@ -2524,7 +3562,7 @@ function handleLogin() {
   session = { username: user.username, role: user.role, loginAt: Number(user.lastLoginAt) || Date.now() };
   localStorage.setItem(STORAGE_KEYS.ui, JSON.stringify({ lastUser: user.username }));
 
-  els.currentUser.textContent = `${user.username} (${roleLabel(user.role)})`;
+  updateCurrentUserDisplay();
   els.loginContainer.classList.add('hidden');
   els.appContainer.classList.remove('hidden');
 
@@ -2560,8 +3598,19 @@ function handleLogout() {
   els.appContainer.classList.add('hidden');
   els.appContainer.classList.remove('sidebar-open');
   els.passwordInput.value = '';
+  updateCurrentUserDisplay();
   els.content.innerHTML = '';
   els.sidebar.innerHTML = '';
+  if (realtimeRenderRateTimer) {
+    clearTimeout(realtimeRenderRateTimer);
+    realtimeRenderRateTimer = null;
+  }
+  pendingRealtimeRender = false;
+  if (presenceViewRefreshTimer) {
+    clearTimeout(presenceViewRefreshTimer);
+    presenceViewRefreshTimer = null;
+  }
+  saveData({ immediate: true });
 }
 
 function startClock() {
@@ -2684,9 +3733,6 @@ function navigate(page) {
   }
 
   currentPage = page;
-  if (session && previousPage !== page) {
-    addLog(`Acessou a tela "${PAGE_TITLES[page] || page}"`);
-  }
   updatePresence(currentPage);
   els.currentPageTitle.textContent = PAGE_TITLES[page] || 'Portal';
   renderContent(page);
@@ -2762,15 +3808,19 @@ function renderDashboard() {
   if (!user && session) {
     ensureCoreUsers();
     if (!getCurrentUser()) {
-      users.push(
-        normalizeUser({
-          username: session.username,
-          password: DEFAULT_PASSWORD,
-          role: session.role || 'member',
-          status: 'active',
-          debt: 0
-        })
-      );
+      const sessionKey = String(session.username || '').trim().toLowerCase();
+      const canRestoreLockedUser = sessionKey === 'esther' || sessionKey === 'inteligencia tp';
+      if (canRestoreLockedUser) {
+        users.push(
+          normalizeUser({
+            username: session.username,
+            password: DEFAULT_PASSWORD,
+            role: session.role || 'member',
+            status: 'active',
+            debt: 0
+          })
+        );
+      }
     }
     persistLocalDataOnly();
     user = getCurrentUser();
@@ -3078,7 +4128,7 @@ function renderDashboard() {
   const goalOutput = document.getElementById('dashboard-goal-output');
 
   if (canShowAggregateChart) {
-    drawFinanceSeriesCanvasAnimated(totalCanvas, aggregateSeries, {
+    drawFinanceSeriesCanvas(totalCanvas, aggregateSeries, {
       secondaryKey: 'charge',
       paidLabel: 'Carteira TP',
       debtLabel: 'Cobrado TP',
@@ -3173,10 +4223,31 @@ function renderDashboard() {
 
 function renderWalletControl() {
   if (!canManageWallets()) {
-    renderAccessDenied('Apenas admins podem controlar carteiras.');
+    renderAccessDenied('Apenas cargos acima de membro podem controlar carteiras.');
     return;
   }
 
+  const nowTs = Date.now();
+  const todayKey = getDayKeyFromTimestamp(nowTs);
+  const baseAutomationSettings = getWalletAutomationSettings();
+  let autoRunResult = null;
+  if (
+    baseAutomationSettings.enabled
+    && baseAutomationSettings.autoRunOnWalletControlOpen
+    && baseAutomationSettings.lastRunDay !== todayKey
+  ) {
+    autoRunResult = runWalletLateAutomation({
+      actor: session ? session.username : 'sistema',
+      referenceTs: nowTs
+    });
+    if (autoRunResult && autoRunResult.ok && autoRunResult.appliedCount > 0) {
+      addLog(
+        `Auto-cobranca de atraso ao abrir carteiras: ${autoRunResult.appliedCount} membro(s), total ${formatCurrency(autoRunResult.totalAmount)}`
+      );
+    }
+  }
+
+  const automationSettings = getWalletAutomationSettings();
   const isMasterAdmin = Boolean(session && session.role === 'superadmin');
   const selectedMonthKey = getCurrentMonthKey();
 
@@ -3184,9 +4255,33 @@ function renderWalletControl() {
     .filter((user) => user.role === 'member')
     .slice()
     .sort((a, b) => a.username.localeCompare(b.username));
+  members.forEach((member) => {
+    ensureUserBillingProfile(member);
+  });
   const membersWithChart = members.filter((member) => canUserHaveWalletChart(member));
   const aggregateMonth = getAggregateMonthFinanceSummary(selectedMonthKey, members);
   const aggregateSeries = buildAggregateFinanceSeries(8, selectedMonthKey, members);
+  const lateCandidates = buildLateChargeCandidates(members, nowTs);
+  const eligibleLateCandidates = lateCandidates.filter((entry) => entry.eligible);
+  const latePotentialTotal = eligibleLateCandidates.reduce((sum, entry) => sum + (Number(entry.totalAmount) || 0), 0);
+
+  const automationRowsHtml = lateCandidates.length > 0
+    ? lateCandidates
+      .slice(0, 40)
+      .map((entry) => `
+        <tr data-user="${escapeHtml(entry.username)}">
+          <td>${escapeHtml(entry.username)}</td>
+          <td>${escapeHtml(entry.status === 'active' ? 'Ativo' : 'Bloqueado')}</td>
+          <td>${formatCurrency(entry.debt)}</td>
+          <td>${formatDateTime(entry.dueTimestamp)}</td>
+          <td>${Math.max(0, Number(entry.overdueAfterGrace) || 0)} dia(s)</td>
+          <td>${formatCurrency(entry.fineAmount)}</td>
+          <td>${formatCurrency(entry.interestAmount)}</td>
+          <td>${entry.eligible ? formatCurrency(entry.totalAmount) : escapeHtml(entry.reason || '-')}</td>
+        </tr>
+      `)
+      .join('')
+    : '<tr><td colspan="8" class="empty-state">Nenhum membro disponivel para analise.</td></tr>';
 
   const memberRowsHtml = members.length > 0
     ? members
@@ -3194,6 +4289,13 @@ function renderWalletControl() {
           const summary = getUserFinanceMonthSummary(member, selectedMonthKey);
           const canToggleChart = isEsther() && member.role === 'member';
           const chartLabel = member.walletChartEnabled ? 'Ativo' : 'Desligado';
+          const billingPolicy = getUserEffectiveBillingPolicy(member);
+          const latePreview = calculateUserLateChargePreview(member, nowTs);
+          const dueLabel = `Dia ${billingPolicy.dueDay} (+${billingPolicy.graceDays}d)`;
+          const ruleLabel = `${formatBillingFineRule(billingPolicy.fineMode, billingPolicy.fineValue)} | juros ${Number(billingPolicy.interestMonthlyPercent || 0).toFixed(2)}%/mes`;
+          const lateLabel = latePreview.eligible
+            ? `${formatCurrency(latePreview.totalAmount)} (${Math.max(0, Number(latePreview.overdueAfterGrace) || 0)}d)`
+            : toShortText(latePreview.reason || '-', 46);
           const walletHealthOptions = WALLET_HEALTH_VALUES
             .map((value) => `<option value="${escapeHtml(value)}" ${normalizeWalletHealth(member.walletHealth) === value ? 'selected' : ''}>${escapeHtml(walletHealthLabel(value))}</option>`)
             .join('');
@@ -3208,6 +4310,9 @@ function renderWalletControl() {
                   ${walletHealthOptions}
                 </select>
               </td>
+              <td>${escapeHtml(dueLabel)}</td>
+              <td>${escapeHtml(ruleLabel)}</td>
+              <td>${escapeHtml(lateLabel)}</td>
               <td><input type="number" min="0" step="0.01" data-field="debt" value="${Number(member.debt).toFixed(2)}" /></td>
               <td><input type="number" min="0" step="0.01" data-field="charged" value="${Number(member.totalCharged).toFixed(2)}" /></td>
               <td><input type="number" min="0" step="0.01" data-field="paid" value="${Number(member.totalPaid).toFixed(2)}" /></td>
@@ -3217,6 +4322,8 @@ function renderWalletControl() {
                   <button class="btn-primary" data-action="save-wallet">Salvar</button>
                   <button class="btn-secondary" data-action="charge">Multa</button>
                   <button class="btn-secondary" data-action="payment">Pagamento</button>
+                  <button class="btn-secondary" data-action="apply-late" ${latePreview.eligible ? '' : 'disabled'}>Atraso agora</button>
+                  <button class="btn-ghost" data-action="billing-profile">Regras atraso</button>
                   <button class="btn-ghost" data-action="reset-chart">Zerar grafico</button>
                   <button class="btn-ghost" data-action="toggle-chart" ${canToggleChart ? '' : 'disabled'}>Grafico</button>
                 </div>
@@ -3225,7 +4332,7 @@ function renderWalletControl() {
           `;
         })
         .join('')
-    : '<tr><td colspan="10" class="empty-state">Nenhum membro cadastrado.</td></tr>';
+    : '<tr><td colspan="13" class="empty-state">Nenhum membro cadastrado.</td></tr>';
 
   const chartCardsHtml = membersWithChart.length > 0
     ? membersWithChart
@@ -3251,6 +4358,10 @@ function renderWalletControl() {
         .join('')
     : '<div class="empty-state">Nenhum membro com grafico ativo.</div>';
 
+  const autoRunInfoHtml = autoRunResult
+    ? `<small class="panel-subtitle">Ultimo auto-run da tela: ${escapeHtml(autoRunResult.message || '-')} ${autoRunResult.ok ? `| Total ${formatCurrency(autoRunResult.totalAmount || 0)}` : ''}</small>`
+    : '';
+
   els.content.innerHTML = `
     <section class="panel wallet-panel">
       <div class="panel-header">
@@ -3262,6 +4373,7 @@ function renderWalletControl() {
           <button id="wallet-control-refresh" class="btn-ghost">Atualizar painel</button>
         </div>
       </div>
+      ${autoRunInfoHtml}
 
       <canvas id="wallet-control-total-canvas" class="wallet-canvas tp-total-canvas"></canvas>
       <div class="wallet-summary-grid">
@@ -3288,8 +4400,84 @@ function renderWalletControl() {
     <section class="panel">
       <div class="panel-header">
         <div>
+          <h3 class="panel-title">Motor de multa e juros por atraso</h3>
+          <p class="panel-subtitle">Configure regras globais, rode cobranca automatica e veja preview dos membros elegiveis.</p>
+        </div>
+      </div>
+
+      <form id="wallet-automation-form" class="form-grid">
+        <div>
+          <label for="wallet-auto-due-day">Dia de vencimento</label>
+          <input id="wallet-auto-due-day" type="number" min="1" max="28" step="1" value="${automationSettings.dueDay}" />
+        </div>
+        <div>
+          <label for="wallet-auto-grace-days">Dias de tolerancia</label>
+          <input id="wallet-auto-grace-days" type="number" min="0" max="45" step="1" value="${automationSettings.graceDays}" />
+        </div>
+        <div>
+          <label for="wallet-auto-min-debt">Divida minima</label>
+          <input id="wallet-auto-min-debt" type="number" min="0" step="0.01" value="${Number(automationSettings.minDebtForLateCharge).toFixed(2)}" />
+        </div>
+        <div>
+          <label for="wallet-auto-fine-mode">Modo de multa</label>
+          <select id="wallet-auto-fine-mode">
+            <option value="percent" ${automationSettings.fineMode === 'percent' ? 'selected' : ''}>Percentual (%)</option>
+            <option value="fixed" ${automationSettings.fineMode === 'fixed' ? 'selected' : ''}>Valor fixo (R$)</option>
+          </select>
+        </div>
+        <div>
+          <label for="wallet-auto-fine-value">Valor da multa</label>
+          <input id="wallet-auto-fine-value" type="number" min="0" step="0.01" value="${Number(automationSettings.fineValue).toFixed(2)}" />
+        </div>
+        <div>
+          <label for="wallet-auto-interest-monthly">Juros mensal (%)</label>
+          <input id="wallet-auto-interest-monthly" type="number" min="0" max="100" step="0.01" value="${Number(automationSettings.interestMonthlyPercent).toFixed(2)}" />
+        </div>
+        <div>
+          <label for="wallet-auto-interest-cap">Teto de juros por ciclo (%)</label>
+          <input id="wallet-auto-interest-cap" type="number" min="0" max="400" step="0.01" value="${Number(automationSettings.interestCapPercent).toFixed(2)}" />
+        </div>
+        <div>
+          <label><input id="wallet-auto-enabled" type="checkbox" ${automationSettings.enabled ? 'checked' : ''} /> Automacao ativa</label>
+          <label><input id="wallet-auto-blocked" type="checkbox" ${automationSettings.applyToBlockedUsers ? 'checked' : ''} /> Incluir bloqueados</label>
+          <label><input id="wallet-auto-open-run" type="checkbox" ${automationSettings.autoRunOnWalletControlOpen ? 'checked' : ''} /> Rodar ao abrir carteiras</label>
+        </div>
+        <div class="full inline-actions">
+          <button id="wallet-auto-save" class="btn-primary" type="button">Salvar regras</button>
+          <button id="wallet-auto-preview" class="btn-secondary" type="button">Atualizar preview</button>
+          <button id="wallet-auto-run" class="btn-secondary" type="button">Executar hoje</button>
+          <button id="wallet-auto-run-force" class="btn-ghost" type="button">Forcar execucao</button>
+        </div>
+      </form>
+
+      <div id="wallet-automation-output" class="tool-output">
+        Elegiveis agora: <strong>${eligibleLateCandidates.length}</strong> | Potencial imediato: <strong>${formatCurrency(latePotentialTotal)}</strong> | Ultimo run: <strong>${automationSettings.lastRunDay || 'nunca'}</strong>
+      </div>
+
+      <div class="table-wrap" style="margin-top: 10px;">
+        <table>
+          <thead>
+            <tr>
+              <th>Membro</th>
+              <th>Status</th>
+              <th>Divida</th>
+              <th>Ultimo vencimento</th>
+              <th>Atraso efetivo</th>
+              <th>Multa</th>
+              <th>Juros</th>
+              <th>Total hoje</th>
+            </tr>
+          </thead>
+          <tbody id="wallet-automation-rows">${automationRowsHtml}</tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <div>
           <h3 class="panel-title">Ajuste direto (individual)</h3>
-          <p class="panel-subtitle">Admins ajustam valores e data/hora de lancamentos. Apenas superadmin altera a saude da carteira.</p>
+          <p class="panel-subtitle">Cargos altos ajustam carteira, aplicam atraso por membro e personalizam regras individuais.</p>
         </div>
       </div>
       <div class="filters" style="grid-template-columns: 1fr; margin-top: 4px;">
@@ -3304,6 +4492,9 @@ function renderWalletControl() {
               <th>Pago</th>
               <th>Multa</th>
               <th>Saude</th>
+              <th>Vencimento</th>
+              <th>Regra atraso</th>
+              <th>Atraso hoje</th>
               <th>Divida</th>
               <th>Total cobrado</th>
               <th>Total pago</th>
@@ -3336,8 +4527,14 @@ function renderWalletControl() {
   const searchInput = document.getElementById('wallet-control-search');
   const rowsElement = document.getElementById('wallet-control-rows');
   const totalCanvas = document.getElementById('wallet-control-total-canvas');
+  const automationOutput = document.getElementById('wallet-automation-output');
+  const automationRows = document.getElementById('wallet-automation-rows');
+  const automationSaveButton = document.getElementById('wallet-auto-save');
+  const automationPreviewButton = document.getElementById('wallet-auto-preview');
+  const automationRunButton = document.getElementById('wallet-auto-run');
+  const automationRunForceButton = document.getElementById('wallet-auto-run-force');
 
-  drawFinanceSeriesCanvasAnimated(totalCanvas, aggregateSeries, {
+  drawFinanceSeriesCanvas(totalCanvas, aggregateSeries, {
     secondaryKey: 'charge',
     paidLabel: 'Carteira membros',
     debtLabel: 'Cobrado membros',
@@ -3352,7 +4549,117 @@ function renderWalletControl() {
     drawWalletCanvas(canvas, member, { anchorMonthKey: selectedMonthKey });
   });
 
+  function readAutomationFormValues() {
+    const dueDay = Number(document.getElementById('wallet-auto-due-day').value);
+    const graceDays = Number(document.getElementById('wallet-auto-grace-days').value);
+    const minDebtForLateCharge = Number(document.getElementById('wallet-auto-min-debt').value);
+    const fineMode = String(document.getElementById('wallet-auto-fine-mode').value || 'percent');
+    const fineValue = Number(document.getElementById('wallet-auto-fine-value').value);
+    const interestMonthlyPercent = Number(document.getElementById('wallet-auto-interest-monthly').value);
+    const interestCapPercent = Number(document.getElementById('wallet-auto-interest-cap').value);
+    const enabled = document.getElementById('wallet-auto-enabled').checked;
+    const applyToBlockedUsers = document.getElementById('wallet-auto-blocked').checked;
+    const autoRunOnWalletControlOpen = document.getElementById('wallet-auto-open-run').checked;
+    return normalizeWalletAutomationSettings({
+      ...settings.walletAutomation,
+      enabled,
+      dueDay,
+      graceDays,
+      minDebtForLateCharge,
+      fineMode,
+      fineValue,
+      interestMonthlyPercent,
+      interestCapPercent,
+      applyToBlockedUsers,
+      autoRunOnWalletControlOpen,
+      updatedAt: Date.now()
+    });
+  }
+
+  function renderAutomationPreview(candidates, title = 'Preview atualizado.') {
+    const safeCandidates = Array.isArray(candidates) ? candidates : [];
+    const eligible = safeCandidates.filter((entry) => entry.eligible);
+    const potential = eligible.reduce((sum, entry) => sum + (Number(entry.totalAmount) || 0), 0);
+    automationOutput.innerHTML = `${escapeHtml(title)} Elegiveis: <strong>${eligible.length}</strong> | Potencial: <strong>${formatCurrency(potential)}</strong>`;
+    if (safeCandidates.length === 0) {
+      automationRows.innerHTML = '<tr><td colspan="8" class="empty-state">Sem dados para mostrar.</td></tr>';
+      return;
+    }
+    automationRows.innerHTML = safeCandidates
+      .slice(0, 40)
+      .map((entry) => `
+        <tr data-user="${escapeHtml(entry.username)}">
+          <td>${escapeHtml(entry.username)}</td>
+          <td>${escapeHtml(entry.status === 'active' ? 'Ativo' : 'Bloqueado')}</td>
+          <td>${formatCurrency(entry.debt)}</td>
+          <td>${formatDateTime(entry.dueTimestamp)}</td>
+          <td>${Math.max(0, Number(entry.overdueAfterGrace) || 0)} dia(s)</td>
+          <td>${formatCurrency(entry.fineAmount)}</td>
+          <td>${formatCurrency(entry.interestAmount)}</td>
+          <td>${entry.eligible ? formatCurrency(entry.totalAmount) : escapeHtml(entry.reason || '-')}</td>
+        </tr>
+      `)
+      .join('');
+  }
+
   refreshButton.addEventListener('click', () => {
+    renderWalletControl();
+  });
+
+  automationSaveButton.addEventListener('click', () => {
+    const next = readAutomationFormValues();
+    settings.walletAutomation = normalizeWalletAutomationSettings({
+      ...next,
+      lastRunDay: settings.walletAutomation && settings.walletAutomation.lastRunDay
+        ? settings.walletAutomation.lastRunDay
+        : '',
+      updatedAt: Date.now()
+    });
+    saveData();
+    addLog(
+      `Atualizou regras de atraso (ativo=${settings.walletAutomation.enabled ? 'sim' : 'nao'}, vencimento dia ${settings.walletAutomation.dueDay}, multa ${formatBillingFineRule(settings.walletAutomation.fineMode, settings.walletAutomation.fineValue)}, juros ${settings.walletAutomation.interestMonthlyPercent.toFixed(2)}%/mes)`
+    );
+    showNotification('Regras de multa/juros salvas.', 'success');
+    renderWalletControl();
+  });
+
+  automationPreviewButton.addEventListener('click', () => {
+    const previousPolicy = settings.walletAutomation;
+    settings.walletAutomation = readAutomationFormValues();
+    const previewCandidates = buildLateChargeCandidates(members, Date.now());
+    settings.walletAutomation = previousPolicy;
+    renderAutomationPreview(previewCandidates, 'Preview com parametros atuais do formulario.');
+  });
+
+  automationRunButton.addEventListener('click', () => {
+    settings.walletAutomation = readAutomationFormValues();
+    const result = runWalletLateAutomation({
+      actor: session ? session.username : 'sistema',
+      referenceTs: Date.now(),
+      force: false
+    });
+    if (!result.ok) {
+      showNotification(result.message || 'Nao foi possivel executar agora.', 'warning');
+      return;
+    }
+    addLog(`Executou cobranca automatica de atraso (${result.appliedCount} membros, total ${formatCurrency(result.totalAmount)})`);
+    showNotification(`Automacao executada: ${result.appliedCount} membro(s), total ${formatCurrency(result.totalAmount)}.`, 'success');
+    renderWalletControl();
+  });
+
+  automationRunForceButton.addEventListener('click', () => {
+    settings.walletAutomation = readAutomationFormValues();
+    const result = runWalletLateAutomation({
+      actor: session ? session.username : 'sistema',
+      referenceTs: Date.now(),
+      force: true
+    });
+    if (!result.ok) {
+      showNotification(result.message || 'Nao foi possivel forcar agora.', 'warning');
+      return;
+    }
+    addLog(`Forcou cobranca automatica de atraso (${result.appliedCount} membros, total ${formatCurrency(result.totalAmount)})`);
+    showNotification(`Execucao forcada concluida: ${result.appliedCount} membro(s), total ${formatCurrency(result.totalAmount)}.`, 'success');
     renderWalletControl();
   });
 
@@ -3376,10 +4683,11 @@ function renderWalletControl() {
         : baseShare;
       remaining -= share;
       if (share > 0) {
-        registerFinanceEvent(member, 'charge', share, 'Divida geral rateada');
+        registerFinanceEvent(member, 'charge', share, 'Divida geral rateada', null, { skipSave: true });
       }
     });
 
+    saveData();
     addLog(`Aplicou divida geral ${formatCurrency(amount)} para ${targetMembers.length} membros (rateio)`);
     showNotification('Divida geral distribuida com sucesso.', 'success');
     renderWalletControl();
@@ -3395,6 +4703,8 @@ function renderWalletControl() {
       member.emergencyLoanOutstanding = 0;
       member.financeHistory = [];
       member.financeUpdatedAt = Date.now();
+      member.billingProfile = normalizeUserBillingProfile({ updatedAt: Date.now() }, Date.now());
+      member.billingUpdatedAt = member.billingProfile.updatedAt;
     });
     saveData();
     addLog('Resetou todas as carteiras de membros para 0 (novo ciclo)');
@@ -3421,12 +4731,138 @@ function renderWalletControl() {
     if (!target || target.role !== 'member') return;
     const action = button.dataset.action;
 
+    if (action === 'apply-late') {
+      const result = applyLateChargesToUser(target, {
+        actor: session ? session.username : 'sistema',
+        referenceTs: Date.now(),
+        eventTimestamp: Date.now()
+      });
+      if (!result.ok) {
+        showNotification(result.reason || 'Sem atraso elegivel para cobrar agora.', 'warning');
+        return;
+      }
+      addLog(
+        `Aplicou atraso manual em ${target.username}: total ${formatCurrency(result.totalAmount)} (multa ${formatCurrency(result.fineAmount)} + juros ${formatCurrency(result.interestAmount)})`
+      );
+      showNotification(`Atraso aplicado em ${target.username}: ${formatCurrency(result.totalAmount)}.`, 'success');
+      renderWalletControl();
+      return;
+    }
+
+    if (action === 'billing-profile') {
+      const profile = ensureUserBillingProfile(target);
+      const currentPolicy = getUserEffectiveBillingPolicy(target);
+      const dueInput = prompt(
+        `Dia de vencimento de ${target.username} (1-28). Deixe vazio para usar global (${currentPolicy.dueDay}):`,
+        profile.dueDay === null ? '' : String(profile.dueDay)
+      );
+      if (dueInput === null) return;
+      const graceInput = prompt(
+        `Dias de tolerancia para ${target.username}. Deixe vazio para usar global (${currentPolicy.graceDays}):`,
+        profile.graceDays === null ? '' : String(profile.graceDays)
+      );
+      if (graceInput === null) return;
+      const fineModeInput = prompt(
+        `Modo de multa para ${target.username} (default, fixed, percent):`,
+        String(profile.fineMode || 'default')
+      );
+      if (fineModeInput === null) return;
+      const fineValueInput = prompt(
+        `Valor de multa para ${target.username}. Vazio = global atual (${formatBillingFineRule(currentPolicy.fineMode, currentPolicy.fineValue)}):`,
+        profile.fineValue === null ? '' : String(profile.fineValue)
+      );
+      if (fineValueInput === null) return;
+      const interestInput = prompt(
+        `Juros mensal (%) para ${target.username}. Vazio = global (${Number(currentPolicy.interestMonthlyPercent).toFixed(2)}):`,
+        profile.interestMonthlyPercent === null ? '' : String(profile.interestMonthlyPercent)
+      );
+      if (interestInput === null) return;
+      const capInput = prompt(
+        `Teto de juros por ciclo (%) para ${target.username}. Vazio = global (${Number(currentPolicy.interestCapPercent).toFixed(2)}):`,
+        profile.interestCapPercent === null ? '' : String(profile.interestCapPercent)
+      );
+      if (capInput === null) return;
+      const minDebtInput = prompt(
+        `Divida minima para atraso de ${target.username}. Vazio = global (${formatCurrency(currentPolicy.minDebtForLateCharge)}):`,
+        profile.minDebtForLateCharge === null ? '' : String(profile.minDebtForLateCharge)
+      );
+      if (minDebtInput === null) return;
+      const pauseInput = prompt(
+        `Pausar cobranca automatica para ${target.username}? (sim/nao):`,
+        profile.paused ? 'sim' : 'nao'
+      );
+      if (pauseInput === null) return;
+
+      const parseOptionalInt = (raw, min, max) => {
+        const trimmed = String(raw || '').trim();
+        if (!trimmed) return null;
+        const parsed = Number(trimmed);
+        if (!Number.isFinite(parsed)) return { invalid: true };
+        return Math.max(min, Math.min(max, Math.floor(parsed)));
+      };
+      const parseOptionalAmount = (raw, min = 0, max = 1000000) => {
+        const trimmed = String(raw || '').trim().replace(',', '.');
+        if (!trimmed) return null;
+        const parsed = Number(trimmed);
+        if (!Number.isFinite(parsed)) return { invalid: true };
+        return Math.max(min, Math.min(max, Number(parsed.toFixed(2))));
+      };
+
+      const dueDay = parseOptionalInt(dueInput, 1, 28);
+      const graceDays = parseOptionalInt(graceInput, 0, 45);
+      const fineMode = String(fineModeInput || '').trim().toLowerCase();
+      const fineValue = parseOptionalAmount(fineValueInput, 0, 100000);
+      const interestMonthlyPercent = parseOptionalAmount(interestInput, 0, 100);
+      const interestCapPercent = parseOptionalAmount(capInput, 0, 400);
+      const minDebtForLateCharge = parseOptionalAmount(minDebtInput, 0, 1000000);
+      if (
+        (dueDay && dueDay.invalid)
+        || (graceDays && graceDays.invalid)
+        || (fineValue && fineValue.invalid)
+        || (interestMonthlyPercent && interestMonthlyPercent.invalid)
+        || (interestCapPercent && interestCapPercent.invalid)
+        || (minDebtForLateCharge && minDebtForLateCharge.invalid)
+      ) {
+        showNotification('Valor invalido em alguma regra individual.', 'warning');
+        return;
+      }
+      if (!['default', 'fixed', 'percent'].includes(fineMode)) {
+        showNotification('Modo de multa invalido. Use default, fixed ou percent.', 'warning');
+        return;
+      }
+
+      const pauseNormalized = ['sim', 's', 'yes', 'y', '1', 'true'].includes(String(pauseInput || '').trim().toLowerCase());
+      const updatedProfile = normalizeUserBillingProfile({
+        ...profile,
+        dueDay,
+        graceDays,
+        fineMode,
+        fineValue,
+        interestMonthlyPercent,
+        interestCapPercent,
+        minDebtForLateCharge,
+        paused: pauseNormalized,
+        updatedAt: Date.now()
+      }, Date.now());
+
+      target.billingProfile = updatedProfile;
+      target.billingUpdatedAt = updatedProfile.updatedAt;
+      saveData();
+      addLog(
+        `Atualizou regra de atraso individual de ${target.username} (vencimento ${updatedProfile.dueDay === null ? 'global' : updatedProfile.dueDay}, multa ${updatedProfile.fineMode}, pausa=${updatedProfile.paused ? 'sim' : 'nao'})`
+      );
+      showNotification(`Regras individuais de ${target.username} atualizadas.`, 'success');
+      renderWalletControl();
+      return;
+    }
+
     if (action === 'toggle-chart') {
       if (!isEsther()) {
         showNotification('Somente Esther pode definir quem possui grafico.', 'error');
         return;
       }
       target.walletChartEnabled = !target.walletChartEnabled;
+      target.walletChartUpdatedAt = Date.now();
       saveData();
       addLog(`Esther ${target.walletChartEnabled ? 'ativou' : 'desativou'} grafico de ${target.username} pelo controle de carteiras`);
       showNotification(`Grafico de ${target.username} ${target.walletChartEnabled ? 'ativado' : 'desativado'}.`, 'success');
@@ -3527,6 +4963,12 @@ function renderWalletControl() {
       target.totalCharged = Math.max(0, target.debt);
       target.emergencyLoanOutstanding = 0;
       target.financeUpdatedAt = Date.now();
+      const profile = ensureUserBillingProfile(target);
+      profile.lateAccruedDays = 0;
+      profile.cycleInterestAccrued = 0;
+      profile.fineAppliedCycleKey = '';
+      profile.updatedAt = Date.now();
+      target.billingUpdatedAt = profile.updatedAt;
       saveData();
       addLog(`Zerou grafico da carteira de ${target.username} no controle de carteiras`);
       showNotification('Valor do grafico zerado com sucesso.', 'success');
@@ -3655,7 +5097,16 @@ function renderMyTickets() {
     `).join('');
   }
 
-  searchInput.addEventListener('input', drawRows);
+  let searchDebounceTimer = null;
+  searchInput.addEventListener('input', () => {
+    if (searchDebounceTimer) {
+      clearTimeout(searchDebounceTimer);
+    }
+    searchDebounceTimer = setTimeout(() => {
+      searchDebounceTimer = null;
+      drawRows();
+    }, 120);
+  });
   statusSelect.addEventListener('change', drawRows);
   prioritySelect.addEventListener('change', drawRows);
 
@@ -4455,11 +5906,15 @@ function renderUsersManagement() {
       user.role = newRole;
       user.roleUpdatedAt = Date.now();
       if (newRole !== 'member') {
+        if (user.walletChartEnabled !== false) {
+          user.walletChartUpdatedAt = Date.now();
+        }
         user.walletChartEnabled = false;
         user.privateChatDailyLimit = null;
         user.privateChatUsage = { date: '', used: 0 };
       } else if (typeof user.walletChartEnabled !== 'boolean') {
         user.walletChartEnabled = shouldDefaultWalletChartEnabled(user.username);
+        user.walletChartUpdatedAt = Date.now();
         user.privateChatDailyLimit = Math.max(0, Number(settings.memberPrivateChatDailyLimit) || DEFAULT_MEMBER_PRIVATE_CHAT_LIMIT);
       }
       saveData();
@@ -4523,6 +5978,7 @@ function renderUsersManagement() {
         return;
       }
       user.walletChartEnabled = !user.walletChartEnabled;
+      user.walletChartUpdatedAt = Date.now();
       saveData();
       addLog(`Esther ${user.walletChartEnabled ? 'ativou' : 'desativou'} grafico de carteira para ${user.username}`);
       showNotification(`Grafico de ${user.username} ${user.walletChartEnabled ? 'ativado' : 'desativado'}.`, 'success');
@@ -4810,7 +6266,7 @@ function renderLogs() {
 
   function getFilteredLogs() {
     const query = searchInput.value.trim().toLowerCase();
-    return logs
+    return capLogs(logs.map(normalizeLogEntry))
       .slice()
       .sort((a, b) => b.timestamp - a.timestamp)
       .filter((log) => {
@@ -4826,13 +6282,22 @@ function renderLogs() {
       return;
     }
 
-    rows.innerHTML = filtered.map((log) => `
+    const visible = filtered.slice(0, MAX_LOG_ROWS_RENDER);
+    const tableRows = visible.map((log) => `
       <tr>
         <td>${formatDateTime(log.timestamp)}</td>
         <td>${escapeHtml(log.user)}</td>
         <td>${escapeHtml(log.action)}</td>
       </tr>
-    `).join('');
+    `);
+    if (filtered.length > visible.length) {
+      tableRows.push(`
+        <tr>
+          <td colspan="3" class="empty-state">Mostrando os ${visible.length} registros mais recentes de ${filtered.length} resultado(s).</td>
+        </tr>
+      `);
+    }
+    rows.innerHTML = tableRows.join('');
   }
 
   function exportCsv() {
@@ -6229,11 +7694,7 @@ function renderSuperTools() {
         ensureCoreUsers();
         tickets = Array.isArray(payload.tickets) ? payload.tickets.map(normalizeTicket) : tickets;
         logs = Array.isArray(payload.logs)
-          ? payload.logs.map((log) => ({
-              timestamp: Number(log.timestamp) || Date.now(),
-              user: String(log.user || 'sistema'),
-              action: String(log.action || 'acao nao informada')
-            }))
+          ? capLogs(payload.logs.map(normalizeLogEntry))
           : logs;
         tasks = Array.isArray(payload.tasks) ? payload.tasks.map(normalizeTask) : tasks;
         notes = Array.isArray(payload.notes) ? payload.notes.map(normalizeNote) : notes;
@@ -6693,10 +8154,12 @@ function renderTasks() {
     const step = TASK_FLOW.indexOf(task.status);
     if (action === 'back' && step > 0) {
       task.status = TASK_FLOW[step - 1];
+      task.updatedAt = Date.now();
     }
 
     if (action === 'next' && step < TASK_FLOW.length - 1) {
       task.status = TASK_FLOW[step + 1];
+      task.updatedAt = Date.now();
     }
 
     saveData();
@@ -7396,6 +8859,18 @@ function renderAccessDenied(message) {
   `;
 }
 
+function syncActiveTicketChatView() {
+  if (!session || activeChatTicketId === null) return;
+  if (!els.chatModal || els.chatModal.classList.contains('hidden')) return;
+  const ticket = tickets.find((item) => item.id === activeChatTicketId);
+  if (!ticket || !canAccessTicket(ticket)) {
+    closeChat();
+    return;
+  }
+  els.chatTitle.textContent = `Conversa #${ticket.id} - ${ticket.title}`;
+  renderChatMessages(ticket);
+}
+
 function openChat(ticketId) {
   const ticket = tickets.find((item) => item.id === ticketId);
   if (!ticket) {
@@ -7457,6 +8932,7 @@ function sendMessage() {
     content: text,
     timestamp: Date.now()
   });
+  ticket.messages = mergeTicketMessages(ticket.messages, []);
   ticket.updatedAt = Date.now();
 
   saveData();
@@ -7519,6 +8995,15 @@ function bindStaticEvents() {
     }
     removePresence();
     disconnectPresenceSocket(false);
+    if (realtimeRenderRateTimer) {
+      clearTimeout(realtimeRenderRateTimer);
+      realtimeRenderRateTimer = null;
+    }
+    if (presenceViewRefreshTimer) {
+      clearTimeout(presenceViewRefreshTimer);
+      presenceViewRefreshTimer = null;
+    }
+    saveData({ immediate: true });
   });
 
   document.addEventListener('keydown', (event) => {
@@ -7528,6 +9013,30 @@ function bindStaticEvents() {
   });
 
   window.addEventListener('storage', (event) => {
+    if (event.key === STORAGE_KEYS.users || event.key === STORAGE_KEYS.settings) {
+      if (event.key === STORAGE_KEYS.users) {
+        const refreshedUsers = safeParse(localStorage.getItem(STORAGE_KEYS.users), users);
+        users = Array.isArray(refreshedUsers) ? refreshedUsers.map(normalizeUser) : users;
+        ensureCoreUsers();
+      }
+      if (event.key === STORAGE_KEYS.settings) {
+        const refreshedSettings = safeParse(localStorage.getItem(STORAGE_KEYS.settings), settings);
+        settings = normalizeSettings(refreshedSettings);
+      }
+      const syncResult = syncSessionFromUsers({ source: `storage:${event.key}`, notify: true });
+      if (syncResult.changed && !syncResult.loggedOut && session) {
+        requestRealtimeRender();
+      }
+    }
+
+    if (event.key === STORAGE_KEYS.tickets) {
+      const refreshedTickets = safeParse(localStorage.getItem(STORAGE_KEYS.tickets), tickets);
+      tickets = Array.isArray(refreshedTickets) ? refreshedTickets.map(normalizeTicket) : tickets;
+      syncActiveTicketChatView();
+      if (currentPage === 'myTickets' || currentPage === 'pending' || currentPage === 'allTickets') {
+        requestRealtimeRender();
+      }
+    }
     if (event.key === STORAGE_KEYS.stealthBus) {
       syncStealthFromStorage();
     }
@@ -7543,7 +9052,7 @@ function bindStaticEvents() {
     if ((event.key === STORAGE_KEYS.logs || event.key === STORAGE_KEYS.users) && currentPage === 'intelCenter') {
       const refreshedLogs = safeParse(localStorage.getItem(STORAGE_KEYS.logs), logs);
       const refreshedUsers = safeParse(localStorage.getItem(STORAGE_KEYS.users), users);
-      logs = Array.isArray(refreshedLogs) ? refreshedLogs : logs;
+      logs = Array.isArray(refreshedLogs) ? capLogs(refreshedLogs.map(normalizeLogEntry)) : logs;
       users = Array.isArray(refreshedUsers) ? refreshedUsers.map(normalizeUser) : users;
       ensureCoreUsers();
       if (!shouldDeferRealtimeRenderForPage('intelCenter')) {
@@ -7552,7 +9061,7 @@ function bindStaticEvents() {
     }
     if ((event.key === STORAGE_KEYS.logs || event.key === STORAGE_KEYS.presence) && currentPage === 'logs') {
       const refreshedLogs = safeParse(localStorage.getItem(STORAGE_KEYS.logs), logs);
-      logs = Array.isArray(refreshedLogs) ? refreshedLogs : logs;
+      logs = Array.isArray(refreshedLogs) ? capLogs(refreshedLogs.map(normalizeLogEntry)) : logs;
       renderLogs();
     }
     if ((event.key === STORAGE_KEYS.users || event.key === STORAGE_KEYS.settings) && currentPage === 'dashboard') {
@@ -7583,7 +9092,7 @@ function bindStaticEvents() {
       const refreshedLogs = safeParse(localStorage.getItem(STORAGE_KEYS.logs), logs);
       users = Array.isArray(refreshedUsers) ? refreshedUsers.map(normalizeUser) : users;
       ensureCoreUsers();
-      logs = Array.isArray(refreshedLogs) ? refreshedLogs : logs;
+      logs = Array.isArray(refreshedLogs) ? capLogs(refreshedLogs.map(normalizeLogEntry)) : logs;
       if (!shouldDeferRealtimeRenderForPage('espionage')) {
         renderEspionage();
       }
@@ -7605,4 +9114,3 @@ function bootstrap() {
 }
 
 bootstrap();
-         
