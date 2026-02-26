@@ -1663,3 +1663,392 @@ textarea:focus {
     scroll-behavior: auto !important;
   }
 }
+
+/* ===== TP Purple Rebrand (Total) ===== */
+:root {
+  --bg-0: #08030f;
+  --bg-1: #120720;
+  --bg-2: #22103c;
+  --surface: rgba(31, 15, 56, 0.68);
+  --surface-solid: #1d0f34;
+  --surface-soft: #2a1550;
+  --border: rgba(196, 150, 255, 0.3);
+  --text: #f8eeff;
+  --muted: #c9afe7;
+  --primary: #b45cff;
+  --primary-strong: #e159ff;
+  --accent: #f3a8ff;
+  --danger: #ff5f79;
+  --warning: #ffbe7a;
+  --shadow: 0 18px 44px rgba(7, 2, 16, 0.52);
+}
+
+body {
+  background:
+    radial-gradient(58% 52% at 8% 12%, rgba(179, 103, 255, 0.26), transparent 72%),
+    radial-gradient(52% 48% at 90% 2%, rgba(112, 76, 255, 0.2), transparent 76%),
+    radial-gradient(46% 42% at 80% 88%, rgba(255, 83, 176, 0.18), transparent 72%),
+    linear-gradient(135deg, #07020f 0%, #140826 42%, #1c0c34 100%);
+}
+
+body::before,
+body::after {
+  opacity: 0.66;
+}
+
+body::before {
+  inset: -20%;
+  background:
+    conic-gradient(from 40deg at 24% 38%, rgba(184, 112, 255, 0.2), transparent 34%),
+    conic-gradient(from 220deg at 82% 22%, rgba(103, 162, 255, 0.12), transparent 36%),
+    radial-gradient(circle at 30% 74%, rgba(243, 94, 255, 0.14), transparent 58%);
+  filter: blur(12px) saturate(130%);
+  animation: tpNebulaShift 22s ease-in-out infinite alternate;
+}
+
+body::after {
+  inset: -28%;
+  background:
+    radial-gradient(32% 26% at 68% 70%, rgba(221, 133, 255, 0.16), transparent 78%),
+    radial-gradient(36% 28% at 18% 84%, rgba(135, 111, 255, 0.14), transparent 80%);
+  filter: blur(30px) saturate(135%);
+  animation: tpNebulaShift 28s ease-in-out infinite alternate-reverse;
+}
+
+@keyframes tpNebulaShift {
+  0% {
+    transform: translate3d(-1.4%, -1.2%, 0) scale(1);
+  }
+  100% {
+    transform: translate3d(1.8%, 1.4%, 0) scale(1.06);
+  }
+}
+
+.ambient-bg {
+  z-index: -5;
+  overflow: hidden;
+}
+
+.ambient-bg::before,
+.ambient-bg::after {
+  content: '';
+  position: absolute;
+  border-radius: 999px;
+  pointer-events: none;
+}
+
+.ambient-bg::before {
+  width: 520px;
+  height: 520px;
+  left: -140px;
+  top: -180px;
+  background: radial-gradient(circle at 30% 30%, rgba(203, 126, 255, 0.42), rgba(203, 126, 255, 0));
+  filter: blur(28px);
+  animation: tpOrbital 24s linear infinite;
+}
+
+.ambient-bg::after {
+  width: 620px;
+  height: 620px;
+  right: -180px;
+  bottom: -220px;
+  background: radial-gradient(circle at 70% 72%, rgba(114, 120, 255, 0.34), rgba(114, 120, 255, 0));
+  filter: blur(36px);
+  animation: tpOrbital 30s linear infinite reverse;
+}
+
+@keyframes tpOrbital {
+  0% {
+    transform: rotate(0deg) translate3d(0, 0, 0);
+  }
+  100% {
+    transform: rotate(360deg) translate3d(0, 0, 0);
+  }
+}
+
+.glow {
+  opacity: 0.58;
+  filter: blur(78px);
+}
+
+.glow-a {
+  background: #9f63ff;
+}
+
+.glow-b {
+  background: #c44dff;
+}
+
+.grid-noise {
+  opacity: 0.12;
+  background-image:
+    linear-gradient(rgba(221, 185, 255, 0.22) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(221, 185, 255, 0.22) 1px, transparent 1px);
+  background-size: 30px 30px;
+  animation: tpGridDrift 18s linear infinite;
+}
+
+@keyframes tpGridDrift {
+  0% {
+    transform: translateY(0);
+  }
+  100% {
+    transform: translateY(30px);
+  }
+}
+
+.login-container {
+  position: relative;
+  isolation: isolate;
+}
+
+.login-container::before {
+  content: '';
+  position: absolute;
+  inset: 8% 12%;
+  border-radius: 30px;
+  border: 1px solid rgba(214, 175, 255, 0.22);
+  background: linear-gradient(120deg, rgba(162, 86, 255, 0.08), rgba(255, 97, 207, 0.05));
+  filter: blur(0.4px);
+  pointer-events: none;
+}
+
+.login-panel {
+  gap: 26px;
+  perspective: 1200px;
+}
+
+.login-showcase,
+.login-card {
+  background: linear-gradient(150deg, rgba(33, 16, 58, 0.88), rgba(13, 8, 26, 0.9));
+  border-color: rgba(216, 171, 255, 0.28);
+  box-shadow: 0 30px 56px rgba(8, 3, 20, 0.56);
+  backdrop-filter: blur(18px) saturate(125%);
+}
+
+.login-showcase {
+  position: relative;
+  overflow: hidden;
+}
+
+.login-showcase::after {
+  content: '';
+  position: absolute;
+  inset: -30% -40%;
+  background: conic-gradient(from 120deg, rgba(204, 122, 255, 0.14), transparent 36%, rgba(114, 124, 255, 0.12), transparent 72%);
+  animation: tpRotateSlow 22s linear infinite;
+  pointer-events: none;
+}
+
+@keyframes tpRotateSlow {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.login-showcase h1 {
+  font-size: clamp(1.8rem, 2.4vw, 2.7rem);
+  line-height: 1.28;
+}
+
+.eyebrow {
+  color: #f6c3ff;
+}
+
+.app-header {
+  background: linear-gradient(130deg, rgba(28, 12, 48, 0.9), rgba(16, 9, 33, 0.92));
+  border-bottom-color: rgba(214, 162, 255, 0.32);
+  backdrop-filter: blur(22px) saturate(130%);
+}
+
+.app-header::after {
+  background: linear-gradient(90deg, transparent, rgba(224, 175, 255, 0.88), transparent);
+}
+
+.sidebar {
+  background: linear-gradient(180deg, rgba(17, 8, 32, 0.94), rgba(11, 7, 24, 0.95));
+  border-right-color: rgba(200, 151, 255, 0.28);
+}
+
+.sidebar::before {
+  background-image:
+    linear-gradient(rgba(221, 187, 255, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(221, 187, 255, 0.08) 1px, transparent 1px);
+}
+
+.sidebar a {
+  color: #e4d1ff;
+}
+
+.sidebar a:hover {
+  background: rgba(130, 63, 192, 0.26);
+  border-color: rgba(220, 174, 255, 0.32);
+  box-shadow: inset 0 0 0 1px rgba(221, 176, 255, 0.14), 0 10px 22px rgba(8, 2, 20, 0.44);
+}
+
+.sidebar a.active {
+  background: linear-gradient(135deg, rgba(180, 81, 255, 0.3), rgba(107, 79, 255, 0.3));
+  border-color: rgba(232, 192, 255, 0.46);
+  color: #fff5ff;
+}
+
+.panel {
+  background: linear-gradient(150deg, rgba(34, 16, 62, 0.72), rgba(15, 8, 28, 0.78));
+  border-color: rgba(206, 162, 255, 0.31);
+  box-shadow: 0 16px 34px rgba(6, 3, 16, 0.5);
+}
+
+.panel:hover {
+  border-color: rgba(230, 194, 255, 0.42);
+  box-shadow: 0 24px 44px rgba(8, 4, 20, 0.56);
+}
+
+.stat-card,
+.kpi-item,
+.wallet-chart-card,
+.wallet-actions-card,
+.member-wallet-card,
+.announcement,
+.tool-card {
+  background: linear-gradient(150deg, rgba(40, 18, 72, 0.8), rgba(16, 8, 30, 0.82));
+  border-color: rgba(203, 152, 255, 0.27);
+}
+
+thead {
+  background: linear-gradient(180deg, rgba(76, 40, 133, 0.9), rgba(52, 27, 93, 0.92));
+}
+
+tbody tr:nth-child(even) {
+  background: rgba(22, 11, 38, 0.44);
+}
+
+tbody tr:hover td {
+  background: linear-gradient(90deg, rgba(135, 70, 200, 0.2), rgba(77, 39, 128, 0.1));
+}
+
+button {
+  box-shadow: 0 10px 20px rgba(8, 3, 19, 0.48);
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, #a954ff, #e35dff);
+  color: #2b083e;
+}
+
+.btn-secondary {
+  background: linear-gradient(135deg, #6f5dff, #9570ff);
+}
+
+.btn-danger {
+  background: linear-gradient(135deg, #ff5278, #ff7585);
+  color: #38000f;
+}
+
+.btn-ghost {
+  background: rgba(118, 73, 173, 0.28);
+  border-color: rgba(205, 161, 255, 0.34);
+}
+
+input[type='text'],
+input[type='password'],
+input[type='number'],
+input[type='date'],
+select,
+textarea {
+  background: linear-gradient(180deg, rgba(29, 14, 53, 0.92), rgba(15, 8, 29, 0.95));
+  border-color: rgba(199, 152, 255, 0.3);
+  box-shadow: inset 0 1px 0 rgba(245, 215, 255, 0.1);
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: rgba(219, 172, 255, 0.86);
+  box-shadow: 0 0 0 3px rgba(175, 114, 255, 0.24), 0 0 0 1px rgba(226, 188, 255, 0.28) inset;
+}
+
+.wallet-canvas,
+.member-wallet-canvas {
+  border-color: rgba(212, 165, 255, 0.34);
+  background:
+    radial-gradient(circle at 18% 16%, rgba(204, 131, 255, 0.18), transparent 40%),
+    radial-gradient(circle at 80% 20%, rgba(255, 92, 170, 0.1), transparent 44%),
+    linear-gradient(180deg, rgba(25, 11, 42, 0.95), rgba(10, 6, 22, 0.95));
+  box-shadow:
+    inset 0 0 0 1px rgba(242, 222, 255, 0.06),
+    0 16px 30px rgba(5, 2, 14, 0.5),
+    0 0 28px rgba(188, 119, 255, 0.18);
+}
+
+.chart-details,
+.tool-output,
+.chat-messages,
+.stealth-messages,
+.stealth-message,
+.table-wrap {
+  background-color: rgba(17, 9, 31, 0.76);
+  border-color: rgba(202, 157, 255, 0.28);
+}
+
+.notification,
+.live-broadcast {
+  background: linear-gradient(140deg, rgba(40, 18, 73, 0.95), rgba(20, 10, 37, 0.94));
+  border-color: rgba(223, 180, 255, 0.38);
+}
+
+.live-broadcast.critical {
+  border-color: rgba(255, 108, 140, 0.72);
+  background: linear-gradient(130deg, rgba(71, 14, 33, 0.95), rgba(42, 9, 22, 0.92));
+}
+
+.debt-amount {
+  color: #ff6f89 !important;
+  font-weight: 700;
+  text-shadow: 0 0 12px rgba(255, 111, 137, 0.32);
+}
+
+.kpi-item:has(.debt-amount) {
+  border-color: rgba(255, 121, 150, 0.4);
+  background: linear-gradient(145deg, rgba(66, 16, 34, 0.42), rgba(25, 10, 26, 0.5));
+}
+
+#users-rows td:nth-child(8),
+#wallet-control-rows td:nth-child(8),
+#wallet-automation-rows td:nth-child(4),
+#wallet-automation-rows td:nth-child(7) {
+  color: #ff6f89;
+  font-weight: 700;
+}
+
+input[data-field='debt'],
+#wallet-global-debt,
+#wallet-auto-min-debt {
+  border-color: rgba(255, 116, 146, 0.52);
+  box-shadow: inset 0 1px 0 rgba(255, 186, 203, 0.14);
+}
+
+input[data-field='debt']:focus,
+#wallet-global-debt:focus,
+#wallet-auto-min-debt:focus {
+  box-shadow: 0 0 0 3px rgba(255, 107, 141, 0.22), 0 0 0 1px rgba(255, 142, 168, 0.34) inset;
+}
+
+@media (max-width: 920px) {
+  .login-container::before {
+    inset: 6% 5%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .grid-noise,
+  body::before,
+  body::after,
+  .ambient-bg::before,
+  .ambient-bg::after,
+  .login-showcase::after {
+    animation: none !important;
+  }
+}
