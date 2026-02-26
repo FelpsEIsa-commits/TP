@@ -40,6 +40,7 @@ const CONTENT_TYPES = {
 const presenceByUser = new Map();
 const userSockets = new Map();
 const socketUser = new Map();
+const authBySocket = new Map();
 
 function wsLog(...args) {
   if (!DEBUG_WS) return;
@@ -373,6 +374,68 @@ function appStateStats(state) {
   };
 }
 
+function getUserFromAppState(username) {
+  const key = safeText(username, '').toLowerCase();
+  if (!key) return null;
+  const list = Array.isArray(appState && appState.users) ? appState.users : [];
+  const user = list.find((item) => safeText(item && item.username, '').toLowerCase() === key);
+  return user || null;
+}
+
+function getAuthorizedUser(ws) {
+  const auth = authBySocket.get(ws);
+  if (!auth || !auth.username) return null;
+  const user = getUserFromAppState(auth.username);
+  if (!user || user.status === 'blocked') return null;
+  return {
+    username: safeText(user.username, '').toLowerCase(),
+    role: safeRole(user.role),
+    status: user.status
+  };
+}
+
+function canSendLiveBroadcastAs(user) {
+  if (!user) return false;
+  return user.role === 'inteligencia' || user.username === 'esther';
+}
+
+function sendInitialSyncAfterAuth(ws) {
+  sendJson(ws, getSnapshotPayload());
+  sendJson(ws, { type: 'app_state_sync', state: appState, origin: 'server_init' });
+  sendJson(ws, { type: 'stealth_sync', bus: stealthBusState });
+  if (liveBroadcastState) {
+    sendJson(ws, { type: 'live_broadcast_sync', payload: liveBroadcastState });
+  }
+}
+
+function authenticateSocket(ws, payload) {
+  const username = safeText(payload && payload.username, '').toLowerCase();
+  const password = safeText(payload && payload.password, '');
+  if (!username || !password) {
+    sendJson(ws, { type: 'auth_error', message: 'Credenciais ausentes para autenticar no WS.' });
+    return false;
+  }
+
+  const user = getUserFromAppState(username);
+  if (!user || user.status === 'blocked' || safeText(user.password, '') !== password) {
+    sendJson(ws, { type: 'auth_error', message: 'Falha de autenticacao no WS.' });
+    return false;
+  }
+
+  authBySocket.set(ws, {
+    username: safeText(user.username, '').toLowerCase(),
+    authenticatedAt: Date.now()
+  });
+  sendJson(ws, {
+    type: 'auth_ack',
+    username: safeText(user.username, '').toLowerCase(),
+    role: safeRole(user.role),
+    ts: Date.now()
+  });
+  sendInitialSyncAfterAuth(ws);
+  return true;
+}
+
 function getSnapshotPayload() {
   const now = Date.now();
   const snapshot = {};
@@ -432,14 +495,15 @@ function detachSocketFromUser(ws) {
 }
 
 function upsertPresenceFromPayload(ws, payload) {
-  const username = safeText(payload.username).toLowerCase();
-  if (!username) return false;
+  const actor = getAuthorizedUser(ws);
+  if (!actor) return false;
+  const username = actor.username;
 
   attachSocketToUser(ws, username);
   const now = Date.now();
   presenceByUser.set(username, {
     username,
-    role: safeRole(payload.role),
+    role: actor.role,
     page: safePage(payload.page),
     loginAt: Number(payload.loginAt) || now,
     lastSeen: Number(payload.lastSeen) || now
@@ -448,7 +512,8 @@ function upsertPresenceFromPayload(ws, payload) {
 }
 
 function applyLeaveFromPayload(ws, payload) {
-  const requestedUsername = safeText(payload.username).toLowerCase();
+  const actor = getAuthorizedUser(ws);
+  const requestedUsername = actor ? actor.username : '';
   const boundUsername = socketUser.get(ws);
   const username = requestedUsername || boundUsername;
   if (!username) return false;
@@ -500,8 +565,9 @@ function serveStatic(req, res) {
   let pathname = decodeURIComponent(reqUrl.pathname);
   if (pathname === '/') pathname = '/index.html';
 
-  const safePath = path.normalize(path.join(ROOT_DIR, pathname));
-  if (!safePath.startsWith(ROOT_DIR)) {
+  const safePath = path.resolve(ROOT_DIR, `.${pathname}`);
+  const rootWithSep = ROOT_DIR.endsWith(path.sep) ? ROOT_DIR : `${ROOT_DIR}${path.sep}`;
+  if (safePath !== ROOT_DIR && !safePath.startsWith(rootWithSep)) {
     res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('Forbidden');
     return;
@@ -555,12 +621,7 @@ server.on('upgrade', (req, socket, head) => {
 
 wss.on('connection', (ws) => {
   wsLog('client connected', 'clients=', wss.clients.size);
-  sendJson(ws, getSnapshotPayload());
-  sendJson(ws, { type: 'app_state_sync', state: appState, origin: 'server_init' });
-  sendJson(ws, { type: 'stealth_sync', bus: stealthBusState });
-  if (liveBroadcastState) {
-    sendJson(ws, { type: 'live_broadcast_sync', payload: liveBroadcastState });
-  }
+  sendJson(ws, { type: 'auth_required' });
 
   ws.on('message', (raw) => {
     let payload;
@@ -571,6 +632,25 @@ wss.on('connection', (ws) => {
     }
     if (!payload || typeof payload !== 'object') return;
     wsLog('recv', payload.type || 'unknown', 'clients=', wss.clients.size);
+
+    if (payload.type === 'ping') {
+      sendJson(ws, { type: 'pong', ts: Date.now() });
+      return;
+    }
+
+    if (payload.type === 'auth') {
+      const ok = authenticateSocket(ws, payload);
+      if (!ok) {
+        ws.close();
+      }
+      return;
+    }
+
+    const actor = getAuthorizedUser(ws);
+    if (!actor) {
+      sendJson(ws, { type: 'auth_required' });
+      return;
+    }
 
     if (payload.type === 'presence') {
       const changed = upsertPresenceFromPayload(ws, payload);
@@ -588,17 +668,17 @@ wss.on('connection', (ws) => {
       const nextState = normalizeAppState(payload.state);
       const nextSerialized = JSON.stringify(nextState);
       if (nextSerialized === appStateSerialized) {
-        wsLog('skip app_state_sync unchanged', 'origin=', safeText(payload.origin, '') || 'remote');
+        wsLog('skip app_state_sync unchanged', 'actor=', actor.username, 'origin=', safeText(payload.origin, '') || 'remote');
         return;
       }
       appState = nextState;
       appStateSerialized = nextSerialized;
       schedulePersistState();
-      wsLog('apply app_state_sync', appStateStats(appState), 'origin=', safeText(payload.origin, '') || 'remote');
+      wsLog('apply app_state_sync', appStateStats(appState), 'actor=', actor.username, 'origin=', safeText(payload.origin, '') || 'remote');
       broadcastJson({
         type: 'app_state_sync',
         state: appState,
-        origin: safeText(payload.origin, '') || 'remote'
+        origin: safeText(payload.origin, '') || `remote:${actor.username}`
       });
       return;
     }
@@ -611,23 +691,22 @@ wss.on('connection', (ws) => {
     if (payload.type === 'stealth_sync') {
       stealthBusState = normalizeStealthBus(payload.bus);
       schedulePersistState();
-      wsLog('apply stealth_sync', 'sessions=', Array.isArray(stealthBusState.sessions) ? stealthBusState.sessions.length : 0);
+      wsLog('apply stealth_sync', 'actor=', actor.username, 'sessions=', Array.isArray(stealthBusState.sessions) ? stealthBusState.sessions.length : 0);
       broadcastJson({ type: 'stealth_sync', bus: stealthBusState });
       return;
     }
 
     if (payload.type === 'live_broadcast_sync') {
+      if (!canSendLiveBroadcastAs(actor)) {
+        sendJson(ws, { type: 'permission_error', message: 'Sem permissao para broadcast ao vivo.' });
+        return;
+      }
       liveBroadcastState = normalizeLiveBroadcast(payload.payload);
       if (liveBroadcastState) {
         schedulePersistState();
-        wsLog('apply live_broadcast_sync', 'sender=', liveBroadcastState.sender, 'audience=', liveBroadcastState.audience.type);
+        wsLog('apply live_broadcast_sync', 'actor=', actor.username, 'sender=', liveBroadcastState.sender, 'audience=', liveBroadcastState.audience.type);
         broadcastJson({ type: 'live_broadcast_sync', payload: liveBroadcastState });
       }
-      return;
-    }
-
-    if (payload.type === 'ping') {
-      sendJson(ws, { type: 'pong', ts: Date.now() });
       return;
     }
 
@@ -637,6 +716,7 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
+    authBySocket.delete(ws);
     const username = detachSocketFromUser(ws);
     wsLog('client disconnected', username || '-', 'clients=', wss.clients.size);
     if (username) {
