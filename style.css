@@ -2090,9 +2090,20 @@ input[data-field='debt']:focus,
   }
 
   .sidebar {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 20;
+    transform: translateX(-108%);
+    transition: transform 0.2s ease;
     width: min(84vw, 320px);
     max-width: calc(100vw - 36px);
     padding: 10px;
+  }
+
+  .app-container.sidebar-open .sidebar {
+    transform: translateX(0);
   }
 
   .content {
@@ -2324,9 +2335,20 @@ input[data-field='debt']:focus,
   }
 
   .sidebar {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 20;
+    transform: translateX(-108%);
+    transition: transform 0.2s ease;
     width: min(92vw, 340px);
     max-width: calc(100vw - 14px);
     max-height: none;
+  }
+
+  .app-container.sidebar-open .sidebar {
+    transform: translateX(0);
   }
 
   .content {
