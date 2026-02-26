@@ -2080,12 +2080,13 @@ input[data-field='debt']:focus,
   }
 
   .app-container {
-    height: auto;
+    height: 100dvh;
     min-height: 100dvh;
   }
 
   .app-body {
-    min-height: calc(100dvh - 68px);
+    flex: 1;
+    min-height: 0;
   }
 
   .sidebar {
@@ -2097,6 +2098,9 @@ input[data-field='debt']:focus,
   .content {
     width: 100%;
     min-width: 0;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
     padding: 12px 10px 20px;
   }
 
@@ -2290,5 +2294,104 @@ input[data-field='debt']:focus,
   .wallet-canvas,
   .tp-total-canvas {
     height: 192px;
+  }
+}
+
+@media (hover: none) and (pointer: coarse) {
+  html,
+  body {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: hidden;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  .app-container {
+    min-height: 100dvh;
+    height: 100dvh;
+  }
+
+  .app-header {
+    position: sticky;
+    top: 0;
+    z-index: 60;
+  }
+
+  .app-body {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .sidebar {
+    width: min(92vw, 340px);
+    max-width: calc(100vw - 14px);
+    max-height: none;
+  }
+
+  .content {
+    width: 100%;
+    min-width: 0;
+    min-height: 0;
+    height: 100%;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 10px 8px 16px;
+  }
+
+  .panel,
+  .table-wrap,
+  .stats-grid,
+  .split-grid,
+  .wallet-grid,
+  .member-wallet-grid,
+  .wallet-summary-grid,
+  .tool-grid,
+  .task-board,
+  .form-grid,
+  .filters,
+  .grid-2 {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .stats-grid,
+  .split-grid,
+  .wallet-grid,
+  .member-wallet-grid,
+  .wallet-summary-grid,
+  .tool-grid,
+  .task-board,
+  .form-grid,
+  .filters,
+  .grid-2,
+  .wallet-metrics {
+    grid-template-columns: 1fr !important;
+  }
+
+  .table-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  table {
+    min-width: 560px;
+  }
+
+  .inline-actions,
+  .month-actions,
+  .task-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 8px;
+    width: 100%;
+  }
+
+  .inline-actions button,
+  .month-actions button,
+  .task-actions button,
+  .inline-actions select {
+    width: 100%;
+    min-width: 0;
   }
 }
