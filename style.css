@@ -2056,15 +2056,15 @@ input[data-field='debt']:focus,
 /* ===== Mobile Hardening + Chart Palette ===== */
 .wallet-canvas,
 .member-wallet-canvas {
-  border-color: rgba(216, 165, 255, 0.36);
+  border-color: rgba(122, 204, 216, 0.3);
   background:
-    radial-gradient(circle at 18% 14%, rgba(180, 92, 255, 0.2), transparent 42%),
-    radial-gradient(circle at 84% 18%, rgba(255, 63, 99, 0.12), transparent 45%),
-    linear-gradient(180deg, rgba(8, 8, 12, 0.98), rgba(2, 2, 5, 0.99));
+    radial-gradient(circle at 18% 14%, rgba(32, 217, 181, 0.2), transparent 42%),
+    radial-gradient(circle at 84% 18%, rgba(255, 138, 91, 0.12), transparent 45%),
+    linear-gradient(180deg, rgba(8, 14, 20, 0.98), rgba(3, 8, 14, 0.99));
   box-shadow:
-    inset 0 0 0 1px rgba(250, 234, 255, 0.06),
-    0 16px 30px rgba(4, 2, 12, 0.52),
-    0 0 28px rgba(176, 102, 255, 0.18);
+    inset 0 0 0 1px rgba(210, 236, 242, 0.06),
+    0 16px 30px rgba(3, 8, 14, 0.52),
+    0 0 26px rgba(57, 197, 202, 0.16);
 }
 
 @media (max-width: 920px) {
@@ -2415,5 +2415,38 @@ input[data-field='debt']:focus,
   .inline-actions select {
     width: 100%;
     min-width: 0;
+  }
+}
+
+/* ===== Mobile Performance Mode ===== */
+@media (max-width: 920px), (hover: none) and (pointer: coarse) {
+  body::before,
+  body::after,
+  .ambient-bg,
+  .ambient-bg::before,
+  .ambient-bg::after,
+  .glow,
+  .grid-noise,
+  .login-showcase::after,
+  .content > section.panel,
+  .live-broadcast.show {
+    animation: none !important;
+  }
+
+  .ambient-bg {
+    display: none;
+  }
+
+  .app-header,
+  .login-showcase,
+  .login-card,
+  .panel {
+    backdrop-filter: none !important;
+  }
+
+  .wallet-canvas,
+  .member-wallet-canvas {
+    filter: none !important;
+    box-shadow: none !important;
   }
 }
